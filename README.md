@@ -28,22 +28,22 @@ https://scanqr.org/
 
 **Login Step 1**
 ```bash
-curl -X POST "https://orkut.rajaserver.web.id/api/orkut/login" -d "username=08123456789&password=password123"
+curl -X POST "https://orkut.cloudflareariprem.workers.dev/api/orkut/login" -d "username=08123456789&password=password123"
 ```
 
 **Login Step 2**
 ```bash
-curl -X POST "https://orkut.rajaserver.web.id/api/orkut/verify-otp" -d "username=08123456789&otp=123456"
+curl -X POST "https://orkut.cloudflareariprem.workers.dev/api/orkut/verify-otp" -d "username=08123456789&otp=123456"
 ```
 
 **Cek Mutasi**
 ```bash
-curl -X POST "https://orkut.rajaserver.web.id/api/orkut/qris-history" -d "username=08123456789&token=merchant_id:token_string&jenis=masuk"
+curl -X POST "https://orkut.cloudflareariprem.workers.dev/api/orkut/qris-history" -d "username=08123456789&token=merchant_id:token_string&jenis=masuk"
 ```
 
 **Tarik Saldo**
 ```bash
-curl -X POST "https://orkut.rajaserver.web.id/api/orkut/qris-withdraw" -d "username=08123456789&token=merchant_id:token_string&amount=100000"
+curl -X POST "https://orkut.cloudflareariprem.workers.dev/api/orkut/qris-withdraw" -d "username=08123456789&token=merchant_id:token_string&amount=100000"
 ```
 
 ---

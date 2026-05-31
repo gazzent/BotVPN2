@@ -4,6 +4,7 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const app = express();
 const axios = require('axios');
+const dns = require('dns').promises;
 const { isUserReseller, addReseller, removeReseller, listResellersSync } = require('./modules/reseller');
 const winston = require('winston');
 const logger = winston.createLogger({
@@ -60,6 +61,33 @@ async function checkTrialAccess(userId) {
     return lastAccess === today;
   } catch (err) {
     return false; // anggap belum pernah pakai kalau file belum ada
+  }
+}
+
+const ispCache = new Map();
+const ISP_CACHE_TTL = 1000 * 60 * 60; // 1 jam
+
+async function resolveServerIsp(domain) {
+  if (!domain) return 'Unknown ISP';
+
+  const cacheEntry = ispCache.get(domain);
+  if (cacheEntry && Date.now() - cacheEntry.timestamp < ISP_CACHE_TTL) {
+    return cacheEntry.isp;
+  }
+
+  try {
+    const { address } = await dns.lookup(domain);
+    const response = await axios.get(`http://ip-api.com/json/${address}?fields=status,isp,org,message`, { timeout: 5000 });
+    const isp = response.data?.status === 'success'
+      ? (response.data.isp || response.data.org || 'Unknown ISP')
+      : `Unknown ISP`;
+
+    ispCache.set(domain, { isp, timestamp: Date.now() });
+    return isp;
+  } catch (err) {
+    const fallback = 'Unknown ISP';
+    ispCache.set(domain, { isp: fallback, timestamp: Date.now() });
+    return fallback;
   }
 }
 
@@ -1324,13 +1352,69 @@ bot.action('jadi_reseller', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
 
-  await ctx.reply(
-    `📩 Hubungi admin ${ADMIN_USERNAME} untuk menjadi Reseller.\n\n` +
-    `💰 <b>Minimal deposit:</b> Rp100,000\n\n` +
-    `Kirim pesan ke admin dengan format:\n` +
-    `<code>Mau jadi reseller ${userId}</code>`,
-    { parse_mode: 'HTML' }
-  );
+  try {
+    // Cek saldo user
+    const row = await new Promise((resolve, reject) => {
+      db.get('SELECT saldo FROM users WHERE user_id = ?', [userId], (err, row) => {
+        if (err) reject(err); else resolve(row);
+      });
+    });
+
+    const saldo = row ? row.saldo : 0;
+    const RESELLER_MIN = 100000;
+    const saldeFormatted = saldo.toLocaleString('id-ID');
+
+    if (saldo >= RESELLER_MIN) {
+      // Cek apakah sudah jadi reseller
+      if (isUserReseller(userId)) {
+        return await ctx.reply(
+          `✅ Anda sudah menjadi Reseller!\n\n` +
+          `💰 Saldo Anda: <code>Rp ${saldeFormatted}</code>\n\n` +
+          `🎁 <b>Keuntungan Reseller:</b>\n` +
+          `• Dapet Setengah harga\n` +
+          `• Trial Unlimited\n`
+          { parse_mode: 'HTML' }
+        );
+      }
+
+      // Otomatis jadi reseller
+      addReseller(userId);
+      await ctx.reply(
+        `✅ Anda sudah menjadi Reseller!\n\n` +
+        `💰 Saldo Anda: <code>Rp ${saldeFormatted}</code>\n\n` +
+        `🎁 <b>Keuntungan Reseller:</b>\n` +
+        `• Dapet Setengah harga\n` +
+        `• Trial Unlimited\n`
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      const kurang = RESELLER_MIN - saldo;
+      const minFormatted = RESELLER_MIN.toLocaleString('id-ID');
+      const kurangFormatted = kurang.toLocaleString('id-ID');
+
+      await ctx.reply(
+        `⚠️ <b>Saldo Tidak Cukup</b>\n\n` +
+        `💰 Saldo Anda saat ini: <code>Rp ${saldeFormatted}</code>\n` +
+        `❌ Minimal yang diperlukan: <code>Rp ${minFormatted}</code>\n\n` +
+        `📊 Kekurangan: <code>Rp ${kurangFormatted}</code>\n\n` +
+        `🎁 <b>Keuntungan Reseller:</b>\n` +
+        `• Dapet Setengah harga\n` +
+        `• Trial Unlimited\n` +
+        `💳 <b>Cara Top Up:</b>\n` +
+        `Gunakan tombol "💰 TopUp Saldo" di menu utama untuk menambah saldo Anda.\n\n` +
+        `✨ <b>Setelah saldo mencukupi:</b>\n` +
+        `Verifikasi akan otomatis berjalan dan Anda langsung menjadi Reseller!`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  } catch (err) {
+    logger.error('Error in jadi_reseller:', err.message);
+    await ctx.reply(
+      `⚠️ Terjadi kesalahan saat memproses permintaan Anda.\n` +
+      `Hubungi admin untuk bantuan.`,
+      { parse_mode: 'HTML' }
+    );
+  }
 });
 
 bot.action('addserver_reseller', async (ctx) => {
@@ -1690,7 +1774,7 @@ async function startSelectServer(ctx, action, type, page = 0) {
     const isR = await isUserReseller(ctx.from.id);
     const query = 'SELECT * FROM Server'; // urut di JS, bukan SQL
 
-    db.all(query, [], (err, servers) => {
+    db.all(query, [], async (err, servers) => {
       if (err) {
         logger.error('⚠️ Error fetching servers:', err.message);
         return ctx.reply('⚠️ Tidak ada server yang tersedia saat ini.', { parse_mode: 'HTML' });
@@ -1714,17 +1798,66 @@ async function startSelectServer(ctx, action, type, page = 0) {
       });
 
       // ==== SORT SERVER TERSEDIA DI DEPAN, PENUH DI BELAKANG ====
+      const naturalSort = (str1, str2) => {
+        // Extract semua parts (text dan numeric) dalam urutan
+        const extractParts = (str) => {
+          const regex = /([A-Za-z]+)|(\d+)/g;
+          const parts = [];
+          let match;
+          while ((match = regex.exec(str)) !== null) {
+            if (match[2]) {
+              parts.push(parseInt(match[2], 10)); // numeric
+            } else {
+              parts.push(match[1]); // text
+            }
+          }
+          return parts;
+        };
+
+        const arr1 = extractParts(str1);
+        const arr2 = extractParts(str2);
+
+        // Priority order untuk prefix: SG first, then ID, others alphabetic
+        const prefixPriority = (prefix) => {
+          if (prefix === 'SG') return 0;
+          if (prefix === 'ID') return 1;
+          return prefix.charCodeAt(0) + 2;
+        };
+
+        // Jika prefix berbeda, gunakan priority
+        if (arr1[0] !== arr2[0]) {
+          const p1 = prefixPriority(arr1[0]);
+          const p2 = prefixPriority(arr2[0]);
+          if (p1 !== p2) return p1 - p2;
+        }
+
+        // Compare parts satu per satu
+        for (let i = 0; i < Math.min(arr1.length, arr2.length); i++) {
+          if (typeof arr1[i] === 'string' && typeof arr2[i] === 'string') {
+            if (arr1[i] !== arr2[i]) return arr1[i].localeCompare(arr2[i]);
+          } else if (typeof arr1[i] === 'number' && typeof arr2[i] === 'number') {
+            if (arr1[i] !== arr2[i]) return arr1[i] - arr2[i];
+          } else {
+            // Jika tipe berbeda, numeric comes first
+            const isNum1 = typeof arr1[i] === 'number';
+            const isNum2 = typeof arr2[i] === 'number';
+            if (isNum1 !== isNum2) return isNum1 ? -1 : 1;
+          }
+        }
+        return arr1.length - arr2.length;
+      };
+
       filteredServers.sort((a, b) => {
         const aFull = a.total_create_akun >= a.batas_create_akun ? 1 : 0;
         const bFull = b.total_create_akun >= b.batas_create_akun ? 1 : 0;
         if (aFull !== bFull) return aFull - bFull; // server penuh terakhir
-        return b.nama_server.localeCompare(a.nama_server); // Z KE A
+        return naturalSort(a.nama_server, b.nama_server); // SG prioritas, ID kedua, numeric sort
       });
 
       logger.info(`User ${ctx.from.id} melihat ${filteredServers.length} server dari ${servers.length} total`);
 
       // ==== Pagination ====
-      const serversPerPage = 10;
+      const serversPerPage = 6;
       const totalPages = Math.ceil(filteredServers.length / serversPerPage);
       const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
       const start = currentPage * serversPerPage;
@@ -1740,17 +1873,13 @@ async function startSelectServer(ctx, action, type, page = 0) {
 
         row.push({
           text: server1.nama_server + (server1.total_create_akun >= server1.batas_create_akun ? " ⚠️" : ""),
-          callback_data: server1.total_create_akun >= server1.batas_create_akun
-            ? "disabled"
-            : `${action}_username_${type}_${server1.id}`
+          callback_data: `${action}_username_${type}_${server1.id}`
         });
 
         if (server2) {
           row.push({
             text: server2.nama_server + (server2.total_create_akun >= server2.batas_create_akun ? " ⚠️" : ""),
-            callback_data: server2.total_create_akun >= server2.batas_create_akun
-              ? "disabled"
-              : `${action}_username_${type}_${server2.id}`
+            callback_data: `${action}_username_${type}_${server2.id}`
           });
         }
 
@@ -1767,7 +1896,7 @@ async function startSelectServer(ctx, action, type, page = 0) {
       keyboard.push([{ text: '🔙 Kembali ke Menu Utama', callback_data: 'send_main_menu' }]);
 
       // ==== Server List Text ====
-      const serverList = currentServers.map(server => {
+      const serverListLines = await Promise.all(currentServers.map(async server => {
         const hargaPer30Hari = server.harga * 30;
         const isFull = server.total_create_akun >= server.batas_create_akun;
 
@@ -1779,7 +1908,11 @@ async function startSelectServer(ctx, action, type, page = 0) {
         const rawIP = parseInt(server.iplimit, 10) || 0;
         const showIP = rawIP === 0 ? 5 : rawIP;
 
+        const serverDomain = server.domain ? server.domain.toString().trim() : null;
+        const isp = serverDomain ? await resolveServerIsp(serverDomain) : 'Unknown ISP';
+
         return `🌐 *${server.nama_server}*\n` +
+               `🏢 ISP: ${isp}\n` +
                `💰 Harga per hari: Rp${server.harga}\n` +
                `📅 Harga per 30 hari: Rp${hargaPer30Hari}\n` +
                `📊 Quota: ${showQuota}\n` +
@@ -1787,7 +1920,8 @@ async function startSelectServer(ctx, action, type, page = 0) {
                (isFull
                  ? `⚠️ *Server Penuh*`
                  : `👥 Total Create Akun: ${server.total_create_akun}/${server.batas_create_akun}`);
-      }).join('\n\n');
+      }));
+      const serverList = serverListLines.join('\n\n');
 
       // ==== Send / Edit Message ====
       if (ctx.updateType === 'callback_query') {
@@ -4016,7 +4150,7 @@ async function processDeposit(ctx, amount) {
     // ======================
     else if (vars.PAYMENT === "ORKUT") {
       const res = await axios.get(
-        "https://orkut.rajaserver.web.id/api/qris",
+        "https://orkut.cloudflareariprem.workers.dev/api/qris",
         {
           params: {
             qris_string: vars.DATA_QRIS_ORKUT,
@@ -4175,7 +4309,7 @@ async function checkQRISStatus() {
         params.append('jenis', 'masuk');
 
         const res = await axios.post(
-          'https://orkut.rajaserver.web.id/api/orkut/qris-history',
+          'https://orkut.cloudflareariprem.workers.dev/api/orkut/qris-history',
           params,
           {
             headers: {
