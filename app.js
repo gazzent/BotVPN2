@@ -1355,36 +1355,42 @@ bot.action('jadi_reseller', async (ctx) => {
   try {
     // Cek saldo user
     const row = await new Promise((resolve, reject) => {
-      db.get('SELECT saldo FROM users WHERE user_id = ?', [userId], (err, row) => {
-        if (err) reject(err); else resolve(row);
-      });
+      db.get(
+        'SELECT saldo FROM users WHERE user_id = ?',
+        [userId],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        }
+      );
     });
 
     const saldo = row ? row.saldo : 0;
     const RESELLER_MIN = 100000;
-    const saldeFormatted = saldo.toLocaleString('id-ID');
+    const saldoFormatted = saldo.toLocaleString('id-ID');
 
     if (saldo >= RESELLER_MIN) {
       // Cek apakah sudah jadi reseller
       if (isUserReseller(userId)) {
         return await ctx.reply(
           `✅ Anda sudah menjadi Reseller!\n\n` +
-          `💰 Saldo Anda: <code>Rp ${saldeFormatted}</code>\n\n` +
+          `💰 Saldo Anda: <code>Rp ${saldoFormatted}</code>\n\n` +
           `🎁 <b>Keuntungan Reseller:</b>\n` +
           `• Dapet Setengah harga\n` +
-          `• Trial Unlimited\n`
+          `• Trial Unlimited\n`,
           { parse_mode: 'HTML' }
         );
       }
 
       // Otomatis jadi reseller
       addReseller(userId);
+
       await ctx.reply(
-        `✅ Anda sudah menjadi Reseller!\n\n` +
-        `💰 Saldo Anda: <code>Rp ${saldeFormatted}</code>\n\n` +
+        `✅ Anda berhasil menjadi Reseller!\n\n` +
+        `💰 Saldo Anda: <code>Rp ${saldoFormatted}</code>\n\n` +
         `🎁 <b>Keuntungan Reseller:</b>\n` +
         `• Dapet Setengah harga\n` +
-        `• Trial Unlimited\n`
+        `• Trial Unlimited\n`,
         { parse_mode: 'HTML' }
       );
     } else {
@@ -1394,12 +1400,12 @@ bot.action('jadi_reseller', async (ctx) => {
 
       await ctx.reply(
         `⚠️ <b>Saldo Tidak Cukup</b>\n\n` +
-        `💰 Saldo Anda saat ini: <code>Rp ${saldeFormatted}</code>\n` +
+        `💰 Saldo Anda saat ini: <code>Rp ${saldoFormatted}</code>\n` +
         `❌ Minimal yang diperlukan: <code>Rp ${minFormatted}</code>\n\n` +
         `📊 Kekurangan: <code>Rp ${kurangFormatted}</code>\n\n` +
         `🎁 <b>Keuntungan Reseller:</b>\n` +
         `• Dapet Setengah harga\n` +
-        `• Trial Unlimited\n` +
+        `• Trial Unlimited\n\n` +
         `💳 <b>Cara Top Up:</b>\n` +
         `Gunakan tombol "💰 TopUp Saldo" di menu utama untuk menambah saldo Anda.\n\n` +
         `✨ <b>Setelah saldo mencukupi:</b>\n` +
@@ -1408,7 +1414,8 @@ bot.action('jadi_reseller', async (ctx) => {
       );
     }
   } catch (err) {
-    logger.error('Error in jadi_reseller:', err.message);
+    logger.error('Error in jadi_reseller:', err);
+
     await ctx.reply(
       `⚠️ Terjadi kesalahan saat memproses permintaan Anda.\n` +
       `Hubungi admin untuk bantuan.`,
