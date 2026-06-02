@@ -47,8 +47,14 @@ const {
 
 const fsPromises = require('fs/promises');
 const path = require('path');
+const VARS_FILE_PATH = path.join(__dirname, '.vars.json');
+
 const trialFile = path.join(__dirname, 'trial.db');
 const resselFilePath = path.join(__dirname, 'ressel.db');
+
+async function saveVarsConfig() {
+  await fsPromises.writeFile(VARS_FILE_PATH, JSON.stringify(vars, null, 2), 'utf8');
+}
 
 // Mengecek apakah user sudah pakai trial hari ini
 async function checkTrialAccess(userId) {
@@ -501,6 +507,7 @@ const helpMessage = `
 16. /edittotalcreate - Mengedit total pembuatan akun server.
 17. /hapuslog - Menghapus log bot.
 18. /backup - Menjalankan backup otomatis.
+19. /paymet - Mengubah metode pembayaran (GOPAY atau ORKUT).
 
 Gunakan perintah ini dengan format yang benar untuk menghindari kesalahan.
 `;
@@ -1149,6 +1156,33 @@ bot.command('backup', async (ctx) => {
   } catch (e) {
     console.error('❌ Exception di command /backup:', e);
     await ctx.reply('❌ Terjadi kesalahan internal saat memproses backup.');
+  }
+});
+
+bot.command(['paymet', 'payment'], async (ctx) => {
+  try {
+    const requesterId = ctx.from.id;
+    if (!adminIds.includes(requesterId)) {
+      return ctx.reply('🚫 Anda tidak memiliki izin untuk menggunakan perintah ini.');
+    }
+
+    const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
+    if (!args.length) {
+      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT');
+    }
+
+    const selectedPayment = args[0].toUpperCase();
+    if (selectedPayment !== 'GOPAY' && selectedPayment !== 'ORKUT') {
+      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY atau ORKUT yang didukung.');
+    }
+
+    vars.PAYMENT = selectedPayment;
+    await saveVarsConfig();
+
+    await ctx.reply(`✅ Metode pembayaran berhasil diubah ke *${selectedPayment}*`, { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('❌ Exception di command /paymet:', error);
+    await ctx.reply('❌ Terjadi kesalahan saat mengubah metode pembayaran.');
   }
 });
 
@@ -3765,7 +3799,7 @@ bot.action(/server_detail_(\d+)/, async (ctx) => {
   }
 });
 
-bot.on('callback_query', async (ctx) => {
+bot.on('callback_query', async (ctx, next) => {
   const userId = ctx.from.id;
   const data = ctx.callbackQuery.data;
   const userStateData = userState[ctx.chat.id];
@@ -3801,7 +3835,12 @@ bot.on('callback_query', async (ctx) => {
       case 'edit_total_create_akun':
         await handleEditTotalCreateAkun(ctx, userStateData, data);
         break;
+      default:
+        await next();
+        break;
     }
+  } else {
+    await next();
   }
 });
 
@@ -4200,6 +4239,7 @@ async function processDeposit(ctx, amount) {
       parse_mode: 'Markdown',
       reply_markup: {
       inline_keyboard: [
+        [{ text: '🔄 Cek Pembayaran', callback_data: `cek_topup_${uniqueCode}` }],
         [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
       ]
     }
@@ -4221,6 +4261,7 @@ async function processDeposit(ctx, amount) {
       userId,
       timestamp: Date.now(),
       status: 'pending',
+      paymentMethod: vars.PAYMENT,
       qrMessageId: qrMessage?.message_id,
       transactionId
     };
@@ -4279,7 +4320,8 @@ async function checkQRISStatus() {
       }
 
       // PROVIDER-SPECIFIC LOGIC
-      if (vars.PAYMENT === "GOPAY") {
+      const paymentMethod = deposit.paymentMethod || vars.PAYMENT;
+      if (paymentMethod === "GOPAY") {
         // Cek status via API GoPay
         const res = await axios.post(
           "https://v1-gateway.autogopay.site/qris/status",
@@ -4308,54 +4350,9 @@ async function checkQRISStatus() {
           db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
         }
 
-      } else if (vars.PAYMENT === "ORKUT") {
-        // Cek status via API Orkut
-        const params = new URLSearchParams();
-        params.append('username', AUTH_USER);
-        params.append('token', AUTH_TOKEN);
-        params.append('jenis', 'masuk');
-
-        const res = await axios.post(
-          'https://orkut.cloudflareariprem.workers.dev/api/orkut/qris-history',
-          params,
-          {
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'Accept': '*/*'
-            },
-            timeout: 15000
-          }
-        );
-
-        const data = res.data;
-        if (!data?.success || !data.qris_history?.results) {
-          logger.warn(`[QRIS] Response tidak valid ${uniqueCode}`);
-          continue;
-        }
-
-        const list = data.qris_history.results;
-        const normalize = v => Number(String(v || '').replace(/[^\d]/g, '')) || 0;
-        const targetAmount = normalize(deposit.amount);
-
-        const match = list.find(tx => {
-          const kredit = normalize(tx.kredit);
-          const status = String(tx.status || '').toUpperCase();
-          return kredit === targetAmount && status === 'IN';
-        });
-
-        if (!match) {
-          logger.info(`[QRIS] Belum match ${uniqueCode}`);
-          continue;
-        }
-
-        logger.info(`[QRIS] MATCH ${uniqueCode}`);
-        const success = await processMatchingPayment(deposit, match, uniqueCode);
-
-        if (success) {
-          logger.info(`[QRIS] SUCCESS ${uniqueCode}`);
-          delete global.pendingDeposits[uniqueCode];
-          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
-        }
+      } else if (paymentMethod === "ORKUT") {
+        logger.info(`[QRIS] Skip auto ORKUT check ${uniqueCode}`);
+        continue;
       }
 
     } catch (err) {
@@ -4365,7 +4362,70 @@ async function checkQRISStatus() {
 }
 
 // AUTO LOOP
-setInterval(checkQRISStatus, 5000);
+//setInterval(checkQRISStatus, 5000);
+
+async function checkOrkutPendingDeposit(deposit, uniqueCode) {
+  const params = new URLSearchParams();
+  params.append('username', AUTH_USER);
+  params.append('token', AUTH_TOKEN);
+  params.append('jenis', 'masuk');
+
+  const res = await axios.post(
+    'https://orkut.cloudflareariprem.workers.dev/api/orkut/qris-history',
+    params,
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': '*/*'
+      },
+      timeout: 15000
+    }
+  );
+
+  const data = res.data;
+  if (!data?.success || !data.qris_history?.results) {
+    return false;
+  }
+
+  const list = data.qris_history.results;
+  const normalize = v => Number(String(v || '').replace(/[^\d]/g, '')) || 0;
+  const targetAmount = normalize(deposit.amount);
+
+  const match = list.find(tx => {
+    const kredit = normalize(tx.kredit);
+    const status = String(tx.status || '').toUpperCase();
+    return kredit === targetAmount && status === 'IN';
+  });
+
+  if (!match) return false;
+
+  const success = await processMatchingPayment(deposit, match, uniqueCode);
+  return success;
+}
+
+bot.action(/^cek_topup_(.+)$/, async (ctx) => {
+  const code = ctx.match?.[1];
+  if (!code) return ctx.answerCbQuery('Kode tidak valid', { show_alert: true });
+
+  if (!global.pendingDeposits) global.pendingDeposits = {};
+  const depositData = global.pendingDeposits[code];
+  if (!depositData) {
+    return ctx.answerCbQuery('Topup tidak ditemukan atau sudah diproses.', { show_alert: true });
+  }
+
+  await ctx.answerCbQuery('Mengecek pembayaran...');
+  try {
+    const success = await checkOrkutPendingDeposit(depositData, code);
+    if (success) {
+      await ctx.reply('✅ Pembayaran terdeteksi dan saldo berhasil ditambahkan.');
+    } else {
+      await ctx.reply('⚠️ Belum ada pembayaran yang cocok. Tekan tombol lagi setelah transfer selesai.');
+    }
+  } catch (error) {
+    logger.error('❌ Error saat cek pembayaran manual:', error.message);
+    await ctx.reply(`❌ Gagal cek pembayaran: ${error.message}`);
+  }
+});
 
 function keyboard_abc() {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz';
