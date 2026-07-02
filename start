@@ -56,7 +56,7 @@ setup_bot() {
    rm -rf /root/BotVPN2
 
     if [ ! -f /root/BotVPN2/app.js ]; then
-        git clone https://github.com/arivpnstores/BotVPN2.git /root/BotVPN2
+        git clone https://github.com/gazzent/BotVPN2.git /root/BotVPN2
     fi
 apt install jq -y
 apt install npm -y
