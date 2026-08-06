@@ -4,6 +4,8 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const app = express();
 const axios = require('axios');
+const QRCode = require('qrcode');
+const crypto = require('crypto');
 const dns = require('dns').promises;
 const { isUserReseller, addReseller, removeReseller, listResellersSync } = require('./modules/reseller');
 const winston = require('winston');
@@ -25,6 +27,19 @@ if (process.env.NODE_ENV !== 'production') {
     format: winston.format.simple(),
   }));
 }
+
+// ── SAFETY NET ────────────────────────────────────────────────
+// Mencegah bot mati total (proses Node exit) hanya karena satu error
+// tak terduga (mis. error sqlite yang tidak ke-handle, error network
+// yang lolos dari try/catch, dsb). Error tetap dicatat ke log supaya
+// bisa ditelusuri, tapi bot tetap jalan untuk user lain.
+process.on('uncaughtException', (err) => {
+  logger.error(`[UNCAUGHT EXCEPTION] ${err.stack || err.message}`);
+});
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+  logger.error(`[UNHANDLED REJECTION] ${msg}`);
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -50,8 +65,6 @@ const {
   renewshadowsocks 
 } = require('./modules/renew');
 
-const { deleteAccount } = require('./modules/delete');
-
 const fsPromises = require('fs/promises');
 const path = require('path');
 const VARS_FILE_PATH = path.join(__dirname, '.vars.json');
@@ -62,64 +75,6 @@ const resselFilePath = path.join(__dirname, 'ressel.db');
 async function saveVarsConfig() {
   await fsPromises.writeFile(VARS_FILE_PATH, JSON.stringify(vars, null, 2), 'utf8');
 }
-
-// ==================== HELPER USER ACCOUNTS ====================
-
-// Simpan akun baru ke database
-function saveUserAccount({ userId, username, password = 'none', type, serverId, expDays, quota = '0', iplimit = '1', isTrial = false, config = null }) {
-  const now = Date.now();
-  const expMs = parseInt(expDays) * 24 * 60 * 60 * 1000;
-  const expiredAt = now + expMs;
-  const configJson = config ? JSON.stringify(config) : null;
-
-  db.run(
-    `INSERT INTO user_accounts (user_id, username, password, type, server_id, exp_days, quota, iplimit, created_at, expired_at, is_trial, config_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [userId, username, password, type, serverId, expDays, quota, iplimit, now, expiredAt, isTrial ? 1 : 0, configJson],
-    (err) => {
-      if (err) logger.error('❌ Gagal simpan user_accounts:', err.message);
-      else logger.info(`✅ Akun ${username} (${type}) disimpan untuk user ${userId}`);
-    }
-  );
-}
-
-// Update expired_at saat akun diperpanjang
-function renewUserAccount({ userId, username, type, serverId, expDays, quota = '0', iplimit = '1' }) {
-  const now = Date.now();
-  const expMs = parseInt(expDays) * 24 * 60 * 60 * 1000;
-  const newExpiredAt = now + expMs;
-
-  db.run(
-    `UPDATE user_accounts SET expired_at = ?, exp_days = ?, quota = ?, iplimit = ?
-     WHERE user_id = ? AND username = ? AND type = ? AND server_id = ?`,
-    [newExpiredAt, expDays, quota, iplimit, userId, username, type, serverId],
-    function(err) {
-      if (err) logger.error('❌ Gagal update user_accounts:', err.message);
-      else if (this.changes === 0) {
-        // Kalau tidak ada record lama (misal akun lama sebelum fitur ini), insert baru
-        saveUserAccount({ userId, username, type, serverId, expDays, quota, iplimit });
-      } else {
-        logger.info(`✅ Akun ${username} (${type}) diperpanjang untuk user ${userId}`);
-      }
-    }
-  );
-}
-
-// Hapus akun yang sudah expired (dijalankan periodik)
-function deleteExpiredAccounts() {
-  const now = Date.now();
-  db.run(
-    `DELETE FROM user_accounts WHERE expired_at < ?`,
-    [now],
-    function(err) {
-      if (err) logger.error('❌ Gagal hapus expired accounts:', err.message);
-      else if (this.changes > 0) logger.info(`🗑️ ${this.changes} akun expired dihapus dari database`);
-    }
-  );
-}
-
-// Jalankan penghapusan akun expired setiap 1 jam
-setInterval(deleteExpiredAccounts, 60 * 60 * 1000);
 
 // Cek apakah fitur trial sedang aktif (default: true jika belum diset)
 function isTrialEnabled() {
@@ -231,6 +186,60 @@ const GOPAY_KEY = vars.GOPAY_KEY;
 // V2 ORKUT
 const AUTH_USER = vars.AUTH_USERNAME_ORKUT;  // username orderkuota
 const AUTH_TOKEN = vars.AUTH_TOKEN_ORKUT;    // token orderkuota
+// V3 PAKASIR (QRIS)
+const PAKASIR_PROJECT = vars.PAKASIR_PROJECT;   // slug proyek pakasir
+const PAKASIR_APIKEY = vars.PAKASIR_APIKEY;     // api key proyek pakasir
+const PAKASIR_MIN_DEPOSIT = vars.PAKASIR_MIN_DEPOSIT || 1000; // minimal deposit khusus QRIS Pakasir
+// V4 VIOLET MEDIA PAY (QRIS/VA/E-Wallet)
+const VIOLET_APIKEY = vars.VIOLET_APIKEY;
+const VIOLET_SECRETKEY = vars.VIOLET_SECRETKEY;
+const VIOLET_MODE = (vars.VIOLET_MODE || 'live').toLowerCase(); // 'sandbox' atau 'live'
+const VIOLET_BASE_URL = VIOLET_MODE === 'sandbox'
+  ? 'https://violetmediapay.com/api/sanbox'
+  : 'https://violetmediapay.com/api/live';
+const VIOLET_CHANNEL = vars.VIOLET_CHANNEL || 'QRIS';           // kode channel default
+const VIOLET_CALLBACK_URL = vars.VIOLET_CALLBACK_URL || 'https://example.com/callback'; // wajib diisi API, tidak dipakai karena kita pakai polling
+const VIOLET_REDIRECT_URL = vars.VIOLET_REDIRECT_URL || 'https://t.me/';
+const VIOLET_MIN_DEPOSIT = vars.VIOLET_MIN_DEPOSIT || 1000;
+// V5 RAMA SHOP (QRIS)
+const RAMA_APIKEY = vars.RAMA_APIKEY;
+const RAMA_BASE_URL = 'https://ramashop.my.id/api/public';
+const RAMA_MIN_DEPOSIT = vars.RAMA_MIN_DEPOSIT || 1000;
+
+// ======================
+// DAFTAR SEMUA METODE PEMBAYARAN YANG DIDUKUNG BOT
+// Dipakai untuk: menu topup user & panel toggle admin
+// ======================
+const PAYMENT_METHODS_INFO = {
+  GOPAY: {
+    label: '💚 GOPAY QRIS',
+    isConfigured: () => !!GOPAY_KEY
+  },
+  ORKUT: {
+    label: '🏧 ORKUT QRIS',
+    isConfigured: () => !!(AUTH_USER && AUTH_TOKEN && vars.DATA_QRIS_ORKUT)
+  },
+  PAKASIR: {
+    label: '🟣 QRIS Pakasir',
+    isConfigured: () => !!(PAKASIR_PROJECT && PAKASIR_APIKEY)
+  },
+  VIOLET: {
+    label: '🟪 QRIS Violet',
+    isConfigured: () => !!(VIOLET_APIKEY && VIOLET_SECRETKEY)
+  },
+  RAMA: {
+    label: '🟢 QRIS Rama',
+    isConfigured: () => !!RAMA_APIKEY
+  }
+};
+
+// Default metode yang aktif kalau admin belum pernah atur (backward compatible)
+function getEnabledPayments() {
+  if (!Array.isArray(vars.ENABLED_PAYMENTS)) {
+    vars.ENABLED_PAYMENTS = ['PAKASIR', 'VIOLET'];
+  }
+  return vars.ENABLED_PAYMENTS;
+}
 
 const bot = new Telegraf(BOT_TOKEN);
 let ADMIN_USERNAME = '@ARI_VPN_STORE';
@@ -323,28 +332,6 @@ db.run(`CREATE TABLE IF NOT EXISTS trial_usage (
     logger.error('Kesalahan membuat tabel trial_usage:', err.message);
   } else {
     logger.info('trial_usage table created or already exists');
-  }
-});
-
-db.run(`CREATE TABLE IF NOT EXISTS user_accounts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  username TEXT NOT NULL,
-  password TEXT DEFAULT 'none',
-  type TEXT NOT NULL,
-  server_id TEXT NOT NULL,
-  exp_days INTEGER DEFAULT 30,
-  quota TEXT DEFAULT '0',
-  iplimit TEXT DEFAULT '1',
-  created_at INTEGER NOT NULL,
-  expired_at INTEGER NOT NULL,
-  is_trial INTEGER DEFAULT 0,
-  config_json TEXT DEFAULT NULL
-)`, (err) => {
-  if (err) {
-    logger.error('Kesalahan membuat tabel user_accounts:', err.message);
-  } else {
-    logger.info('user_accounts table created or already exists');
   }
 });
 
@@ -541,8 +528,7 @@ let keyboard;
       { text: '♻️ Perpanjang Akun', callback_data: 'service_renew' }
     ],
     [
-      { text: '🎁 Trial Akun', callback_data: 'service_trial' },
-      { text: '📋 Akun Saya', callback_data: 'my_accounts' }
+      { text: '🎁 Trial Akun', callback_data: 'service_trial' }
     ],
     [
       { text: '💰 TopUp Saldo', callback_data: 'topup_saldo' }
@@ -626,7 +612,7 @@ const helpMessage = `
 16. /edittotalcreate - Mengedit total pembuatan akun server.
 17. /hapuslog - Menghapus log bot.
 18. /backup - Menjalankan backup otomatis.
-19. /paymet - Mengubah metode pembayaran (GOPAY atau ORKUT).
+19. /paymet - Mengubah metode pembayaran (GOPAY, ORKUT, PAKASIR, atau VIOLET).
 
 Gunakan perintah ini dengan format yang benar untuk menghindari kesalahan.
 `;
@@ -1228,6 +1214,9 @@ async function sendAdminMenu(ctx) {
       { text: `⚙️ Limit Trial: ${vars.TRIAL_LIMIT || 2}x/24 Jam`, callback_data: 'set_trial_limit' }
     ],
     [
+      { text: '💳 Kelola Metode Pembayaran', callback_data: 'admin_payment_methods' }
+    ],
+    [
       { text: '🔙 Kembali', callback_data: 'send_main_menu' }
     ]
   ];
@@ -1250,6 +1239,88 @@ async function sendAdminMenu(ctx) {
     }
   }
 }
+
+function renderPaymentMethodsKeyboard() {
+  const enabled = getEnabledPayments();
+  const rows = Object.keys(PAYMENT_METHODS_INFO).map((method) => {
+    const info = PAYMENT_METHODS_INFO[method];
+    const isEnabled = enabled.includes(method);
+    const configured = info.isConfigured();
+    let statusIcon;
+    if (!configured) statusIcon = '⚠️ Belum Diset';
+    else statusIcon = isEnabled ? '🟢 AKTIF' : '🔴 NONAKTIF';
+
+    return [{
+      text: `${info.label} — ${statusIcon}`,
+      callback_data: `toggle_payment_${method}`
+    }];
+  });
+
+  rows.push([{ text: '🔙 Kembali', callback_data: 'admin_panel' }]);
+  return rows;
+}
+
+bot.action('admin_panel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!adminIds.includes(ctx.from.id)) {
+    return ctx.reply('🚫 Anda tidak memiliki izin.');
+  }
+  await sendAdminMenu(ctx);
+});
+
+bot.action('admin_payment_methods', async (ctx) => {
+  try {
+    const requesterId = ctx.from.id;
+    if (!adminIds.includes(requesterId)) {
+      return ctx.answerCbQuery('🚫 Anda tidak memiliki izin.', { show_alert: true });
+    }
+    await ctx.answerCbQuery();
+
+    await ctx.editMessageText(
+      '💳 *Kelola Metode Pembayaran*\n\n' +
+      'Tekan salah satu untuk mengaktifkan/menonaktifkan metode tersebut di menu topup user.\n' +
+      '⚠️ = API key/config belum diisi di .vars.json, tidak bisa diaktifkan.',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: renderPaymentMethodsKeyboard() }
+      }
+    );
+  } catch (error) {
+    logger.error('❌ Error saat membuka panel metode pembayaran:', error);
+  }
+});
+
+bot.action(/toggle_payment_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA)/, async (ctx) => {
+  try {
+    const requesterId = ctx.from.id;
+    if (!adminIds.includes(requesterId)) {
+      return ctx.answerCbQuery('🚫 Anda tidak memiliki izin.', { show_alert: true });
+    }
+
+    const method = ctx.match[1];
+    const info = PAYMENT_METHODS_INFO[method];
+
+    if (!info.isConfigured()) {
+      return ctx.answerCbQuery(`⚠️ ${method} belum dikonfigurasi di .vars.json.`, { show_alert: true });
+    }
+
+    const enabled = getEnabledPayments();
+    const idx = enabled.indexOf(method);
+    if (idx === -1) {
+      enabled.push(method);
+      await ctx.answerCbQuery(`✅ ${method} diaktifkan.`);
+    } else {
+      enabled.splice(idx, 1);
+      await ctx.answerCbQuery(`❌ ${method} dinonaktifkan.`);
+    }
+    vars.ENABLED_PAYMENTS = enabled;
+    await saveVarsConfig();
+
+    await ctx.editMessageReplyMarkup({ inline_keyboard: renderPaymentMethodsKeyboard() });
+  } catch (error) {
+    logger.error('❌ Error saat toggle metode pembayaran:', error);
+  }
+});
 
 bot.command('backup', async (ctx) => {
   try {
@@ -1293,12 +1364,24 @@ bot.command(['paymet', 'payment'], async (ctx) => {
 
     const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
     if (!args.length) {
-      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT');
+      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT\natau\n/paymet PAKASIR\natau\n/paymet VIOLET\natau\n/paymet RAMA');
     }
 
     const selectedPayment = args[0].toUpperCase();
-    if (selectedPayment !== 'GOPAY' && selectedPayment !== 'ORKUT') {
-      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY atau ORKUT yang didukung.');
+    if (!['GOPAY', 'ORKUT', 'PAKASIR', 'VIOLET', 'RAMA'].includes(selectedPayment)) {
+      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY, ORKUT, PAKASIR, VIOLET, atau RAMA yang didukung.');
+    }
+
+    if (selectedPayment === 'PAKASIR' && (!PAKASIR_PROJECT || !PAKASIR_APIKEY)) {
+      return ctx.reply('❌ PAKASIR_PROJECT / PAKASIR_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
+    }
+
+    if (selectedPayment === 'VIOLET' && (!VIOLET_APIKEY || !VIOLET_SECRETKEY)) {
+      return ctx.reply('❌ VIOLET_APIKEY / VIOLET_SECRETKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
+    }
+
+    if (selectedPayment === 'RAMA' && !RAMA_APIKEY) {
+      return ctx.reply('❌ RAMA_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
     }
 
     vars.PAYMENT = selectedPayment;
@@ -1616,244 +1699,6 @@ bot.action('toggle_trial', async (ctx) => {
   const statusText = vars.TRIAL_ENABLED ? '🟢 *AKTIF*' : '🔴 *NONAKTIF*';
   await ctx.reply(`✅ Fitur trial berhasil diubah menjadi ${statusText}`, { parse_mode: 'Markdown' });
   await sendAdminMenu(ctx);
-});
-
-// === HANDLER AKUN SAYA ===
-bot.action('my_accounts', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const now = Date.now();
-
-  db.all(
-    `SELECT * FROM user_accounts WHERE user_id = ? AND expired_at > ? ORDER BY created_at DESC`,
-    [userId, now],
-    async (err, rows) => {
-      if (err) {
-        logger.error('Gagal ambil user_accounts:', err.message);
-        return ctx.reply('Terjadi kesalahan saat mengambil data akun.');
-      }
-
-      if (!rows || rows.length === 0) {
-        return ctx.reply(
-          '📋 *Akun Saya*
-
-Anda belum memiliki akun aktif.
-Beli akun melalui menu *➕ Buat Akun*.',
-          {
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: '🔙 Kembali ke Menu', callback_data: 'send_main_menu' }]] }
-          }
-        );
-      }
-
-      let text = '📋 *Daftar Akun Aktif Anda*
-';
-      text += '━━━━━━━━━━━━━━━━━━━━
-
-';
-
-      const keyboard = [];
-      rows.forEach((acc, i) => {
-        const sisaMs = acc.expired_at - now;
-        const sisaHari = Math.floor(sisaMs / (1000 * 60 * 60 * 24));
-        const sisaJam  = Math.floor((sisaMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-        const sisaText = sisaHari > 0 ? `${sisaHari}h ${sisaJam}j` : `${sisaJam} jam`;
-        const badge = acc.is_trial ? '🎁' : '✅';
-        text += `*${i + 1}.* ${badge} *${acc.type.toUpperCase()}* — \`${acc.username}\`
-`;
-        text += `   ⏳ Sisa: ${sisaText} | 💾 ${acc.quota}GB | 🌐 Server ${acc.server_id}
-
-`;
-        keyboard.push([
-          { text: `🔍 Detail #${i+1} ${acc.type.toUpperCase()}`, callback_data: `acc_detail_${acc.id}` },
-          { text: `🗑️ Hapus`, callback_data: `acc_delete_${acc.id}` }
-        ]);
-      });
-
-      text += '━━━━━━━━━━━━━━━━━━━━
-';
-      text += `_Total: ${rows.length} akun aktif_`;
-      keyboard.push([{ text: '🔙 Kembali ke Menu', callback_data: 'send_main_menu' }]);
-
-      await ctx.reply(text, {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: keyboard }
-      });
-    }
-  );
-});
-
-// === HANDLER DETAIL AKUN ===
-bot.action(/^acc_detail_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const accId = ctx.match[1];
-  const userId = ctx.from.id;
-
-  db.get(
-    `SELECT * FROM user_accounts WHERE id = ? AND user_id = ? AND expired_at > ?`,
-    [accId, userId, Date.now()],
-    async (err, acc) => {
-      if (err || !acc) return ctx.reply('❌ Akun tidak ditemukan atau sudah expired.');
-
-      const now = Date.now();
-      const sisaMs = acc.expired_at - now;
-      const sisaHari = Math.floor(sisaMs / (1000 * 60 * 60 * 24));
-      const sisaJam  = Math.floor((sisaMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-      const expDate  = new Date(acc.expired_at).toLocaleDateString('id-ID', {
-        day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit'
-      });
-
-      let config = null;
-      try { config = acc.config_json ? JSON.parse(acc.config_json) : null; } catch(e) {}
-
-      let text = `📋 *Detail Akun ${acc.type.toUpperCase()}*
-`;
-      text += '━━━━━━━━━━━━━━━━━━━━
-';
-      text += `👤 *Username:* \`${acc.username}\`
-`;
-      if (acc.type === 'ssh' && acc.password && acc.password !== 'none') {
-        text += `🔑 *Password:* \`${acc.password}\`
-`;
-      }
-      text += `🌐 *Server ID:* ${acc.server_id}
-`;
-      text += `💾 *Quota:* ${acc.quota} GB
-`;
-      text += `🔗 *IP Limit:* ${acc.iplimit}
-`;
-      text += `📆 *Expired:* ${expDate}
-`;
-      text += `⏳ *Sisa:* ${sisaHari} hari ${sisaJam} jam
-`;
-      if (acc.is_trial) text += `🎁 *Tipe:* Trial
-`;
-      text += '━━━━━━━━━━━━━━━━━━━━
-';
-
-      if (config) {
-        if (acc.type === 'ssh') {
-          text += `🌍 *Domain:* \`${config.domain || '-'}\`
-`;
-          if (config.ns_domain) text += `📡 *NS Domain:* \`${config.ns_domain}\`
-`;
-          if (config.pubkey) text += `🔑 *Pub Key:* \`${config.pubkey}\`
-`;
-          text += `
-🫧 *HTTP Custom:*
-\`${config.domain}:80@${acc.username}:${acc.password}\`
-`;
-        } else {
-          text += `🌍 *Domain:* \`${config.domain || '-'}\`
-`;
-          if (config.uuid) text += `🆔 *UUID:* \`${config.uuid}\`
-`;
-          if (config.tls_link) text += `
-🫧 *URL TLS:*
-\`\`\`
-${config.tls_link}
-\`\`\`
-`;
-          if (config.http_link) text += `🫧 *URL HTTP:*
-\`\`\`
-${config.http_link}
-\`\`\`
-`;
-          if (config.grpc_link) text += `🫧 *URL gRPC:*
-\`\`\`
-${config.grpc_link}
-\`\`\`
-`;
-        }
-        if (config.save_link) text += `
-💾 *Save Config:* [Click Here](${config.save_link})
-`;
-      } else {
-        text += `_Config tidak tersedia (akun lama sebelum fitur ini)_
-`;
-      }
-      text += '━━━━━━━━━━━━━━━━━━━━';
-
-      await ctx.reply(text, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🗑️ Hapus Akun Ini', callback_data: `acc_delete_${acc.id}` }],
-            [{ text: '🔙 Kembali ke Akun Saya', callback_data: 'my_accounts' }]
-          ]
-        }
-      });
-    }
-  );
-});
-
-// === HANDLER KONFIRMASI HAPUS ===
-bot.action(/^acc_delete_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const accId = ctx.match[1];
-  const userId = ctx.from.id;
-
-  db.get(`SELECT * FROM user_accounts WHERE id = ? AND user_id = ?`, [accId, userId], async (err, acc) => {
-    if (err || !acc) return ctx.reply('❌ Akun tidak ditemukan.');
-    await ctx.reply(
-      `⚠️ *Konfirmasi Hapus Akun*
-
-` +
-      `Yakin ingin menghapus akun ini?
-
-` +
-      `👤 Username: \`${acc.username}\`
-` +
-      `🧾 Tipe: ${acc.type.toUpperCase()}
-` +
-      `🌐 Server: ${acc.server_id}
-
-` +
-      `⚠️ *Akun akan dihapus permanen dari server!*`,
-      {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '✅ Ya, Hapus', callback_data: `acc_confirm_${acc.id}` },
-              { text: '❌ Batal', callback_data: 'my_accounts' }
-            ]
-          ]
-        }
-      }
-    );
-  });
-});
-
-// === HANDLER EKSEKUSI HAPUS ===
-bot.action(/^acc_confirm_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const accId = ctx.match[1];
-  const userId = ctx.from.id;
-
-  db.get(`SELECT * FROM user_accounts WHERE id = ? AND user_id = ?`, [accId, userId], async (err, acc) => {
-    if (err || !acc) return ctx.reply('❌ Akun tidak ditemukan.');
-
-    const result = await deleteAccount(acc.username, acc.type, acc.server_id);
-    if (!result.success) return ctx.reply(result.msg, { parse_mode: 'Markdown' });
-
-    db.run(`DELETE FROM user_accounts WHERE id = ?`, [accId], (delErr) => {
-      if (delErr) return ctx.reply('❌ Akun dihapus dari server tapi gagal update database.');
-      ctx.reply(
-        `✅ *Akun berhasil dihapus!*
-
-` +
-        `👤 \`${acc.username}\` (${acc.type.toUpperCase()}) telah dihapus dari server.
-
-` +
-        `Terima kasih sudah menggunakan layanan kami! 🙏`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: [[{ text: '🔙 Kembali ke Menu', callback_data: 'send_main_menu' }]] }
-        }
-      );
-    });
-  });
 });
 
 // === HANDLER SET LIMIT TRIAL ===
@@ -2527,7 +2372,7 @@ bot.action(/(trial)_username_(vmess|vless|trojan|shadowsocks|ssh)_(.+)/, async (
       }
       await saveTrialAccess(ctx.from.id);
     }
-    // Admin & Reseller langsung lolos tanpa dicatat ke trial_usage
+    // Admin & Reseller langsung lolos tanpa dicatat
 
   // === Jika lolos, lanjut buat akun trial ===
 const username = 'trial' + Math.random().toString(36).substring(2, 8).replace(/[^a-z0-9]/g, 'x'); // contoh: trialdr5fd
@@ -2581,17 +2426,6 @@ await bot.telegram.sendMessage(
       if (!func) throw new Error(`Fungsi trial untuk tipe ${type} tidak ditemukan`);
       msg = await func(username, exp, quota, iplimit, serverId);
     }
-    // Simpan akun trial ke database user_accounts (msg sekarang {msg, config})
-    if (typeof msg === 'object' && msg.config !== undefined) {
-      const { msg: msgText, config } = msg;
-      msg = msgText;
-      if (!msg.includes('❌')) {
-        saveUserAccount({ userId: ctx.from.id, username, password, type, serverId, expDays: exp, quota, iplimit, isTrial: true, config });
-      }
-    } else if (!msg.includes('❌')) {
-      saveUserAccount({ userId: ctx.from.id, username, password, type, serverId, expDays: exp, quota, iplimit, isTrial: true });
-    }
-
     await ctx.reply(msg, { parse_mode: 'Markdown' });
 
   } catch (err) {
@@ -3087,16 +2921,6 @@ if (exp > 365) {
               await recordAccountTransaction(ctx.from.id, 'ssh');
             }
             logger.info(`Account created and transaction recorded for user ${ctx.from.id}, type: ${type}`);
-            // Simpan ke database user_accounts (msg sekarang adalah {msg, config})
-            if (typeof msg === 'object' && msg.config !== undefined) {
-              const { msg: msgText, config } = msg;
-              msg = msgText;
-              if (!msg.includes('❌')) {
-                saveUserAccount({ userId: ctx.from.id, username, password, type, serverId, expDays: exp, quota, iplimit, isTrial: false, config });
-              }
-            } else if (!msg.includes('❌')) {
-              saveUserAccount({ userId: ctx.from.id, username, password, type, serverId, expDays: exp, quota, iplimit, isTrial: false });
-            }
 const maskedUsername = username.length > 1 
   ? `${username.slice(0, 1)}${'x'.repeat(username.length - 1)}` 
   : username; // Kalau kurang dari 1 char, tampilkan tanpa masking
@@ -3135,10 +2959,6 @@ await bot.telegram.sendMessage(
               await recordAccountTransaction(ctx.from.id, 'ssh');
             }
             logger.info(`Account renewed and transaction recorded for user ${ctx.from.id}, type: ${type}`);
-            // Update expired_at di database user_accounts
-            if (!msg.includes('❌')) {
-              renewUserAccount({ userId: ctx.from.id, username, type, serverId, expDays: exp, quota, iplimit });
-            }
 const maskedUsername = username.length > 1 
   ? `${username.slice(0, 1)}${'x'.repeat(username.length - 1)}` 
   : username; // Kalau kurang dari 3 char, tampilkan tanpa masking
@@ -4116,29 +3936,75 @@ bot.action('nama_server_edit', async (ctx) => {
 
 bot.action('topup_saldo', async (ctx) => {
   try {
-    await ctx.answerCbQuery(); 
+    await ctx.answerCbQuery();
     const userId = ctx.from.id;
     logger.info(`🔍 User ${userId} memulai proses top-up saldo.`);
-    
 
     if (!global.depositState) {
       global.depositState = {};
     }
-    global.depositState[userId] = { action: 'request_amount', amount: '' };
-    
-    logger.info(`🔍 User ${userId} diminta untuk memasukkan jumlah nominal saldo.`);
-    
+    global.depositState[userId] = { action: 'choose_method' };
 
-    const keyboard = keyboard_nomor();
-    
-    await ctx.editMessageText('💰 *Silakan masukkan jumlah nominal saldo yang Anda ingin tambahkan ke akun Anda:*', {
-      reply_markup: {
-        inline_keyboard: keyboard
-      },
+    const enabled = getEnabledPayments();
+    const availableMethods = Object.keys(PAYMENT_METHODS_INFO).filter(
+      (m) => enabled.includes(m) && PAYMENT_METHODS_INFO[m].isConfigured()
+    );
+
+    if (!availableMethods.length) {
+      return await ctx.editMessageText(
+        '⚠️ *Belum ada metode pembayaran yang aktif.*\nSilakan hubungi admin.',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    logger.info(`🔍 User ${userId} diminta memilih metode pembayaran.`);
+
+    const buttons = availableMethods.map((m) => ([{
+      text: PAYMENT_METHODS_INFO[m].label,
+      callback_data: `topup_method_${m}`
+    }]));
+
+    await ctx.editMessageText('💳 *Silakan pilih metode pembayaran:*', {
+      reply_markup: { inline_keyboard: buttons },
       parse_mode: 'Markdown'
     });
   } catch (error) {
     logger.error('❌ Kesalahan saat memulai proses top-up saldo:', error);
+    await ctx.editMessageText('❌ *GAGAL! Terjadi kesalahan saat memproses permintaan Anda. Silakan coba lagi nanti.*', { parse_mode: 'Markdown' });
+  }
+});
+
+bot.action(/topup_method_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA)/, async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id;
+    const selectedMethod = ctx.match[1];
+    logger.info(`🔍 User ${userId} memilih metode pembayaran ${selectedMethod} untuk top-up.`);
+
+    const enabled = getEnabledPayments();
+    if (!enabled.includes(selectedMethod) || !PAYMENT_METHODS_INFO[selectedMethod].isConfigured()) {
+      return await ctx.editMessageText('❌ *Metode ini sedang tidak aktif. Silakan pilih metode lain.*', { parse_mode: 'Markdown' });
+    }
+
+    if (!global.depositState) {
+      global.depositState = {};
+    }
+    global.depositState[userId] = { action: 'request_amount', amount: '', paymentMethod: selectedMethod };
+
+    const keyboard = keyboard_nomor();
+    const labelMethod = PAYMENT_METHODS_INFO[selectedMethod].label;
+
+    await ctx.editMessageText(
+      `💰 *Metode: ${labelMethod}*\n\nSilakan masukkan jumlah nominal saldo yang Anda ingin tambahkan ke akun Anda:`,
+      {
+        reply_markup: {
+          inline_keyboard: keyboard
+        },
+        parse_mode: 'Markdown'
+      }
+    );
+  } catch (error) {
+    logger.error('❌ Kesalahan saat memilih metode pembayaran:', error);
     await ctx.editMessageText('❌ *GAGAL! Terjadi kesalahan saat memproses permintaan Anda. Silakan coba lagi nanti.*', { parse_mode: 'Markdown' });
   }
 });
@@ -4338,7 +4204,20 @@ async function handleDepositState(ctx, userId, data) {
   // Cek apakah user reseller
   const isReseller = await isUserReseller(userId);
   const statusReseller = isReseller ? 'Reseller' : 'Bukan Reseller';
-  const minDeposit = isReseller ? 50000 : 150;
+  const paymentMethod = global.depositState[userId].paymentMethod || vars.PAYMENT;
+  let minDeposit = isReseller ? 50000 : 150;
+  // QRIS PAKASIR punya batas minimal deposit sendiri (default Rp1.000)
+  if (paymentMethod === 'PAKASIR') {
+    minDeposit = Math.max(minDeposit, PAKASIR_MIN_DEPOSIT);
+  }
+  // VIOLET MEDIA PAY punya batas minimal deposit sendiri (default Rp1.000)
+  if (paymentMethod === 'VIOLET') {
+    minDeposit = Math.max(minDeposit, VIOLET_MIN_DEPOSIT);
+  }
+  // RAMA SHOP punya batas minimal deposit sendiri (default Rp1.000)
+  if (paymentMethod === 'RAMA') {
+    minDeposit = Math.max(minDeposit, RAMA_MIN_DEPOSIT);
+  }
 
   let currentAmount = global.depositState[userId].amount || '';
 
@@ -4358,7 +4237,7 @@ async function handleDepositState(ctx, userId, data) {
     }
 
     global.depositState[userId].action = 'confirm_amount';
-    await processDeposit(ctx, currentAmount);
+    await processDeposit(ctx, currentAmount, paymentMethod);
     return;
   } else {
     if (currentAmount.length < 12) {
@@ -4607,7 +4486,7 @@ const execP = (cmd, opts = {}) =>
 // ============================ 
 // PROCESS DEPOSIT (FINAL UPDATE)
 // ============================
-async function processDeposit(ctx, amount) {
+async function processDeposit(ctx, amount, paymentMethod) {
   const currentTime = Date.now();
 
   if (currentTime - lastRequestTime < requestInterval) {
@@ -4623,6 +4502,9 @@ async function processDeposit(ctx, amount) {
   const userId = ctx.from.id;
   const uniqueCode = `user-${userId}-${Date.now()}`;
 
+  // Metode pembayaran yang dipilih user saat topup (fallback ke default global jika tidak ada)
+  paymentMethod = paymentMethod || vars.PAYMENT;
+
   let finalAmount = Number(amount);
   let adminFee = 0;
 
@@ -4634,7 +4516,7 @@ async function processDeposit(ctx, amount) {
     // ======================
     // GOPAY (NO FEE)
     // ======================
-    if (vars.PAYMENT === "GOPAY") {
+    if (paymentMethod === "GOPAY") {
       finalAmount = Number(amount);
       adminFee = 0;
 
@@ -4684,7 +4566,7 @@ async function processDeposit(ctx, amount) {
     // ======================
     // ORKUT (API BARU) - LANGSUNG KIRIM GAMBAR
     // ======================
-    else if (vars.PAYMENT === "ORKUT") {
+    else if (paymentMethod === "ORKUT") {
       const res = await axios.get(
         "https://api-orkut.shadowsvpn.xyz/api/qris",
         {
@@ -4740,6 +4622,225 @@ async function processDeposit(ctx, amount) {
       qrImageUrl = data.image_data.trim(); // untuk checker
     }
 
+    // ======================
+    // PAKASIR (QRIS)
+    // ======================
+    else if (paymentMethod === "PAKASIR") {
+      if (Number(amount) < PAKASIR_MIN_DEPOSIT) {
+        throw new Error(`Minimal deposit QRIS PAKASIR adalah Rp${PAKASIR_MIN_DEPOSIT.toLocaleString()}`);
+      }
+
+      const res = await axios.post(
+        "https://app.pakasir.com/api/transactioncreate/qris",
+        {
+          project: PAKASIR_PROJECT,
+          order_id: uniqueCode,
+          amount: Number(amount),
+          api_key: PAKASIR_APIKEY
+        },
+        {
+          headers: { "Content-Type": "application/json" },
+          timeout: 15000
+        }
+      );
+
+      const payment = res.data?.payment;
+      if (!payment || !payment.payment_number) throw new Error("Gagal create QRIS PAKASIR");
+
+      finalAmount = Number(payment.total_payment) || Number(amount);
+      adminFee = Number(payment.fee) || 0;
+      transactionId = uniqueCode; // Pakasir mengacu ke order_id + amount, bukan id transaksi terpisah
+
+      // ubah QR string menjadi gambar QR (PNG buffer)
+      const qrBuffer = await QRCode.toBuffer(payment.payment_number, {
+        type: 'png',
+        width: 500,
+        margin: 1
+      });
+
+      const expiredAt = payment.expired_at ? new Date(payment.expired_at).getTime() : null;
+      const expiredText = expiredAt
+        ? new Date(expiredAt).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
+        : '15 menit dari sekarang';
+
+      const caption =
+        `📝 *Detail Pembayaran*\n\n` +
+        `💰 Total: Rp ${finalAmount}\n` +
+        `- Topup: Rp ${amount}\n` +
+        (adminFee > 0 ? `- Biaya QRIS: Rp ${adminFee}\n` : ``) +
+        `\n⏱️ Expired: ${expiredText}\n` +
+        `⚠️ Transfer harus sama persis!\n\n` +
+        `🔄 Sistem otomatis mendeteksi pembayaran.\n` +
+        `Jika belum terdeteksi, tekan *Cek Manual*.`;
+
+      qrMessage = await ctx.replyWithPhoto(
+        { source: qrBuffer },
+        {
+          caption,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Cek Manual', callback_data: `cek_topup_${uniqueCode}` }],
+              [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
+            ]
+          }
+        }
+      );
+
+      qrImageUrl = payment.payment_number;
+
+      // simpan expiredAt supaya checkQRISStatus bisa memakai waktu kadaluarsa asli dari Pakasir
+      if (!global.pendingDeposits) global.pendingDeposits = {};
+      var pakasirExpiredAt = expiredAt;
+    }
+
+    // ======================
+    // VIOLET MEDIA PAY (VA / QRIS / E-Wallet)
+    // ======================
+    else if (paymentMethod === "VIOLET") {
+      if (Number(amount) < VIOLET_MIN_DEPOSIT) {
+        throw new Error(`Minimal deposit VIOLET MEDIA PAY adalah Rp${VIOLET_MIN_DEPOSIT.toLocaleString()}`);
+      }
+
+      // ref_kode wajib numerik menurut dokumentasi VioletMediaPay, jadi dibuat terpisah dari uniqueCode internal
+      const refKode = Date.now().toString().slice(-10);
+      const expiredDate = new Date(Date.now() + 15 * 60 * 1000); // 15 menit dari sekarang
+      const pad = (n) => String(n).padStart(2, '0');
+      const expiredTimeStr = `${expiredDate.getFullYear()}-${pad(expiredDate.getMonth() + 1)}-${pad(expiredDate.getDate())} ${pad(expiredDate.getHours())}:${pad(expiredDate.getMinutes())}:${pad(expiredDate.getSeconds())}`;
+
+      const signature = crypto
+        .createHmac('sha256', VIOLET_SECRETKEY)
+        .update(`${refKode}${VIOLET_APIKEY}${Number(amount)}`)
+        .digest('hex');
+
+      const res = await axios.post(
+        `${VIOLET_BASE_URL}/create`,
+        {
+          api_key: VIOLET_APIKEY,
+          secret_key: VIOLET_SECRETKEY,
+          channel_payment: VIOLET_CHANNEL,
+          ref_kode: refKode,
+          nominal: Number(amount),
+          cus_nama: ctx.from?.first_name || 'User',
+          cus_email: `${userId}@telegram.user`,
+          cus_phone: '081234567890',
+          produk: 'Topup Saldo',
+          url_redirect: VIOLET_REDIRECT_URL,
+          url_callback: VIOLET_CALLBACK_URL,
+          expired_time: expiredTimeStr,
+          signature
+        },
+        {
+          headers: { "Content-Type": "application/json" },
+          timeout: 15000
+        }
+      );
+
+      if (!res.data?.status || !res.data?.data?.[0]) {
+        throw new Error(res.data?.data?.[0]?.status || "Gagal create transaksi VIOLET MEDIA PAY");
+      }
+
+      const trx = res.data.data[0];
+      finalAmount = Number(amount); // fee dipotong dari sisi merchant, bukan ditambahkan ke pelanggan
+      adminFee = Number(trx.fee) || 0;
+      transactionId = trx.id_reference;
+
+      const caption =
+        `📝 *Detail Pembayaran*\n\n` +
+        `💰 Total Bayar: Rp ${finalAmount}\n` +
+        `🏷️ Channel: ${VIOLET_CHANNEL}\n` +
+        `\n⏱️ Expired: ${trx.expired_time || expiredTimeStr}\n` +
+        `⚠️ Transfer harus sama persis!\n\n` +
+        `🔄 Sistem otomatis mendeteksi pembayaran.\n` +
+        `Jika belum terdeteksi, tekan *Cek Manual*.`;
+
+      qrMessage = await ctx.replyWithPhoto(
+        { url: trx.target.startsWith('http') ? trx.target : `https://${trx.target}` },
+        {
+          caption,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Cek Manual', callback_data: `cek_topup_${uniqueCode}` }],
+              [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
+            ]
+          }
+        }
+      );
+
+      qrImageUrl = trx.target;
+
+      if (!global.pendingDeposits) global.pendingDeposits = {};
+      var violetRefKode = refKode;
+      var violetIdReference = trx.id_reference;
+      var violetExpiredAt = expiredDate.getTime();
+    }
+
+    // ======================
+    // RAMA SHOP (QRIS)
+    // ======================
+    else if (paymentMethod === "RAMA") {
+      if (Number(amount) < RAMA_MIN_DEPOSIT) {
+        throw new Error(`Minimal deposit QRIS RAMA adalah Rp${RAMA_MIN_DEPOSIT.toLocaleString()}`);
+      }
+
+      const res = await axios.post(
+        `${RAMA_BASE_URL}/deposit/create`,
+        { amount: Number(amount), method: 'qris' },
+        {
+          headers: {
+            'X-API-Key': RAMA_APIKEY,
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000
+        }
+      );
+
+      if (!res.data?.success || !res.data?.data) {
+        throw new Error(res.data?.message || "Gagal create deposit RAMA SHOP");
+      }
+
+      const trx = res.data.data;
+      finalAmount = Number(trx.totalAmount); // amount + kode unik, ini yang wajib ditransfer user
+      adminFee = Number(trx.fee) || 0;
+      transactionId = trx.depositId;
+
+      const ramaExpiredAtVal = trx.expiredAt ? new Date(trx.expiredAt).getTime() : null;
+      const expiredText = trx.expiredAt
+        ? new Date(trx.expiredAt).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
+        : '15 menit dari sekarang';
+
+      const caption =
+        `📝 *Detail Pembayaran*\n\n` +
+        `💰 Total Bayar: Rp ${finalAmount}\n` +
+        `- Topup: Rp ${amount}\n` +
+        `- Kode Unik: ${trx.uniqueCode}\n` +
+        `\n⏱️ Expired: ${expiredText}\n` +
+        `⚠️ Transfer harus sama persis (termasuk kode unik)!\n\n` +
+        `🔄 Sistem otomatis mendeteksi pembayaran.\n` +
+        `Jika belum terdeteksi, tekan *Cek Manual*.`;
+
+      qrMessage = await ctx.replyWithPhoto(
+        { url: trx.qrImage },
+        {
+          caption,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Cek Manual', callback_data: `cek_topup_${uniqueCode}` }],
+              [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
+            ]
+          }
+        }
+      );
+
+      qrImageUrl = trx.qrImage;
+
+      if (!global.pendingDeposits) global.pendingDeposits = {};
+      var ramaDepositId = trx.depositId;
+      var ramaExpiredAt = ramaExpiredAtVal;
+    }
+
     else throw new Error("PAYMENT tidak valid");
 
     // ======================
@@ -4753,9 +4854,16 @@ async function processDeposit(ctx, amount) {
       userId,
       timestamp: Date.now(),
       status: 'pending',
-      paymentMethod: vars.PAYMENT,
+      paymentMethod: paymentMethod,
       qrMessageId: qrMessage?.message_id,
-      transactionId
+      transactionId,
+      expiredAt: typeof pakasirExpiredAt !== 'undefined' ? pakasirExpiredAt
+        : typeof violetExpiredAt !== 'undefined' ? violetExpiredAt
+        : typeof ramaExpiredAt !== 'undefined' ? ramaExpiredAt
+        : null,
+      violetRefKode: typeof violetRefKode !== 'undefined' ? violetRefKode : null,
+      violetIdReference: typeof violetIdReference !== 'undefined' ? violetIdReference : null,
+      ramaDepositId: typeof ramaDepositId !== 'undefined' ? ramaDepositId : null
     };
 
     // ======================
@@ -4793,12 +4901,27 @@ async function processDeposit(ctx, amount) {
   }
 }
 
+let _isCheckingQRIS = false;
 async function checkQRISStatus() {
+  if (_isCheckingQRIS) return; // proses sebelumnya masih berjalan, skip biar tidak numpuk
   if (!global.pendingDeposits || Object.keys(global.pendingDeposits).length === 0) return;
 
+  _isCheckingQRIS = true;
+  try {
+    await _checkQRISStatusInner();
+  } finally {
+    _isCheckingQRIS = false;
+  }
+}
+
+async function _checkQRISStatusInner() {
+
   const now = Date.now();
-  const EXPIRE_GOPAY  = 15 * 60 * 1000;  // 15 menit
-  const EXPIRE_ORKUT  = 10 * 60 * 1000;  // 10 menit
+  const EXPIRE_GOPAY   = 15 * 60 * 1000;  // 15 menit
+  const EXPIRE_ORKUT   = 10 * 60 * 1000;  // 10 menit
+  const EXPIRE_PAKASIR = 15 * 60 * 1000;  // 15 menit (fallback jika expired_at tidak ada)
+  const EXPIRE_VIOLET  = 15 * 60 * 1000;  // 15 menit (fallback jika expired_time tidak ada)
+  const EXPIRE_RAMA    = 15 * 60 * 1000;  // 15 menit (fallback jika expiredAt tidak ada)
 
   for (const [uniqueCode, deposit] of Object.entries(global.pendingDeposits)) {
     if (deposit.status !== 'pending') continue;
@@ -4807,8 +4930,15 @@ async function checkQRISStatus() {
 
     try {
       // ── EXPIRATION ──────────────────────────────────────────
-      const maxAge = paymentMethod === "GOPAY" ? EXPIRE_GOPAY : EXPIRE_ORKUT;
-      if (now - deposit.timestamp > maxAge) {
+      const defaultMaxAge = paymentMethod === "GOPAY" ? EXPIRE_GOPAY
+        : paymentMethod === "PAKASIR" ? EXPIRE_PAKASIR
+        : paymentMethod === "VIOLET" ? EXPIRE_VIOLET
+        : paymentMethod === "RAMA" ? EXPIRE_RAMA
+        : EXPIRE_ORKUT;
+      const isExpired = (paymentMethod === "PAKASIR" || paymentMethod === "VIOLET" || paymentMethod === "RAMA") && deposit.expiredAt
+        ? now > deposit.expiredAt
+        : (now - deposit.timestamp > defaultMaxAge);
+      if (isExpired) {
         logger.warn(`[AUTO] EXPIRED ${uniqueCode}`);
         delete global.pendingDeposits[uniqueCode];
         db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
@@ -4904,6 +5034,54 @@ Silakan buat topup baru jika masih ingin melanjutkan.`,
           delete global.pendingDeposits[uniqueCode];
           db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
         }
+
+      // ── PAKASIR (AUTO CEK REALTIME) ──────────────────────────
+      } else if (paymentMethod === "PAKASIR") {
+        const status = await checkPakasirStatus(deposit, uniqueCode);
+        if (status !== 'completed') continue;
+
+        logger.info(`[AUTO][PAKASIR] 💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const success = await processMatchingPayment(
+          deposit,
+          { reference_id: uniqueCode, amount: deposit.amount },
+          uniqueCode
+        );
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        }
+
+      // ── VIOLET MEDIA PAY (AUTO CEK REALTIME) ─────────────────
+      } else if (paymentMethod === "VIOLET") {
+        const status = await checkVioletStatus(deposit, uniqueCode);
+        if (status !== 'success') continue;
+
+        logger.info(`[AUTO][VIOLET] 💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const success = await processMatchingPayment(
+          deposit,
+          { reference_id: uniqueCode, amount: deposit.amount },
+          uniqueCode
+        );
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        }
+
+      // ── RAMA SHOP (AUTO CEK REALTIME) ────────────────────────
+      } else if (paymentMethod === "RAMA") {
+        const status = await checkRamaStatus(deposit, uniqueCode);
+        if (status !== 'success') continue;
+
+        logger.info(`[AUTO][RAMA] 💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const success = await processMatchingPayment(
+          deposit,
+          { reference_id: uniqueCode, amount: deposit.amount },
+          uniqueCode
+        );
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        }
       }
 
     } catch (err) {
@@ -4912,16 +5090,88 @@ Silakan buat topup baru jika masih ingin melanjutkan.`,
   }
 }
 
-// ── AUTO LOOP AKTIF ──────────────────────────────────────────
-// GOPAY  → cek tiap 5 detik
-// ORKUT  → cek tiap 8 detik (lebih lambat supaya tidak spam API)
-setInterval(() => {
-  if (vars.PAYMENT === "GOPAY")  checkQRISStatus();
-}, 5000);
+// Cek status transaksi PAKASIR via Transaction Detail API
+async function checkPakasirStatus(deposit, uniqueCode) {
+  try {
+    const res = await axios.get('https://app.pakasir.com/api/transactiondetail', {
+      params: {
+        project: PAKASIR_PROJECT,
+        amount: deposit.originalAmount, // WAJIB pakai nominal asli (sebelum fee), sesuai amount yang dikirim saat create
+        order_id: uniqueCode,
+        api_key: PAKASIR_APIKEY
+      },
+      timeout: 10000
+    });
 
+    const status = res.data?.transaction?.status;
+    logger.info(`[AUTO][PAKASIR] ${uniqueCode} | ${status}`);
+    return status;
+  } catch (err) {
+    // Pakasir mengembalikan 404/error jika transaksi belum dibayar sama sekali
+    return 'pending';
+  }
+}
+
+// Cek status transaksi VIOLET MEDIA PAY via Status Transaksi API
+async function checkVioletStatus(deposit, uniqueCode) {
+  try {
+    if (!deposit.violetRefKode) return 'pending';
+
+    const res = await axios.post(
+      `${VIOLET_BASE_URL}/transactions`,
+      {
+        api_key: VIOLET_APIKEY,
+        secret_key: VIOLET_SECRETKEY,
+        ref: deposit.violetRefKode,
+        ref_id: deposit.violetIdReference
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 10000
+      }
+    );
+
+    const status = res.data?.data?.[0]?.status;
+    logger.info(`[AUTO][VIOLET] ${uniqueCode} | ${status}`);
+    return status; // 'success' | 'Belum Dibayar' | 'kadaluarsa' | 'refund'
+  } catch (err) {
+    return 'pending';
+  }
+}
+
+// Cek status transaksi RAMA SHOP via Deposit Status API
+async function checkRamaStatus(deposit, uniqueCode) {
+  try {
+    if (!deposit.ramaDepositId) return 'pending';
+
+    const res = await axios.get(
+      `${RAMA_BASE_URL}/deposit/status/${deposit.ramaDepositId}`,
+      {
+        headers: {
+          'X-API-Key': RAMA_APIKEY,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+
+    const status = res.data?.data?.status;
+    logger.info(`[AUTO][RAMA] ${uniqueCode} | ${status}`);
+    return status; // 'pending' | 'success' | 'already'
+  } catch (err) {
+    return 'pending';
+  }
+}
+
+// ── AUTO LOOP AKTIF ──────────────────────────────────────────
+// Berjalan terus tiap 5 detik, checkQRISStatus() sendiri akan
+// membedakan cara cek tiap deposit berdasarkan paymentMethod
+// yang tersimpan di masing-masing pending deposit (bukan lagi
+// bergantung pada satu vars.PAYMENT global saja), karena sekarang
+// user bisa pilih metode (PAKASIR/VIOLET/dst) sendiri saat topup.
 setInterval(() => {
-  if (vars.PAYMENT === "ORKUT") checkQRISStatus();
-}, 8000);
+  checkQRISStatus();
+}, 5000);
 
 async function checkOrkutPendingDeposit(deposit, uniqueCode) {
   const params = new URLSearchParams();
@@ -4974,7 +5224,40 @@ bot.action(/^cek_topup_(.+)$/, async (ctx) => {
 
   await ctx.answerCbQuery('Mengecek pembayaran...');
   try {
-    const success = await checkOrkutPendingDeposit(depositData, code);
+    const paymentMethod = depositData.paymentMethod || vars.PAYMENT;
+    let success = false;
+
+    if (paymentMethod === 'PAKASIR') {
+      const status = await checkPakasirStatus(depositData, code);
+      if (status === 'completed') {
+        success = await processMatchingPayment(
+          depositData,
+          { reference_id: code, amount: depositData.amount },
+          code
+        );
+      }
+    } else if (paymentMethod === 'VIOLET') {
+      const status = await checkVioletStatus(depositData, code);
+      if (status === 'success') {
+        success = await processMatchingPayment(
+          depositData,
+          { reference_id: code, amount: depositData.amount },
+          code
+        );
+      }
+    } else if (paymentMethod === 'RAMA') {
+      const status = await checkRamaStatus(depositData, code);
+      if (status === 'success') {
+        success = await processMatchingPayment(
+          depositData,
+          { reference_id: code, amount: depositData.amount },
+          code
+        );
+      }
+    } else {
+      success = await checkOrkutPendingDeposit(depositData, code);
+    }
+
     if (success) {
       await ctx.reply('✅ Pembayaran terdeteksi dan saldo berhasil ditambahkan.');
     } else {
@@ -5077,7 +5360,23 @@ async function sendPaymentSuccessNotification(userId, deposit, currentBalance) {
   }
 }
 
-async function processMatchingPayment(deposit, matchingTransaction, uniqueCode) {
+// ── MUTEX ANTRIAN DATABASE ──────────────────────────────────
+// sqlite3 hanya boleh punya SATU transaksi (BEGIN...COMMIT/ROLLBACK) aktif
+// dalam satu waktu di koneksi yang sama. Karena auto-check jalan tiap 5 detik
+// dan bisa saja overlap (proses sebelumnya belum selesai, atau ada 2+ user
+// bayar hampir bersamaan), semua pemrosesan pembayaran WAJIB di-antre satu-satu
+// supaya tidak terjadi "cannot start a transaction within a transaction".
+let _paymentQueue = Promise.resolve();
+function processMatchingPayment(deposit, matchingTransaction, uniqueCode) {
+  const run = () => _processMatchingPaymentCore(deposit, matchingTransaction, uniqueCode);
+  const resultPromise = _paymentQueue.then(run, run);
+  // reset antrian jadi selalu "resolved" supaya panggilan berikutnya tetap jalan
+  // walaupun panggilan ini gagal/reject
+  _paymentQueue = resultPromise.then(() => {}, () => {});
+  return resultPromise;
+}
+
+async function _processMatchingPaymentCore(deposit, matchingTransaction, uniqueCode) {
   const transactionKey = `${matchingTransaction.reference_id || uniqueCode}_${matchingTransaction.amount}`;
   // Use a database transaction to ensure atomicity
   return new Promise((resolve, reject) => {
