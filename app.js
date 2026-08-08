@@ -224,19 +224,19 @@ const PAYMENT_METHODS_INFO = {
     isConfigured: () => !!(AUTH_USER && AUTH_TOKEN && vars.DATA_QRIS_ORKUT)
   },
   PAKASIR: {
-    label: '🟣 QRIS Pakasir min Rp.500',
+    label: '💳QRIS Pakasir min Rp.500',
     isConfigured: () => !!(PAKASIR_PROJECT && PAKASIR_APIKEY)
   },
   VIOLET: {
-    label: '🟪 QRIS Violet',
+    label: '💳QRIS Violet',
     isConfigured: () => !!(VIOLET_APIKEY && VIOLET_SECRETKEY)
   },
   RAMA: {
-    label: '🟢 QRIS Rama',
+    label: '💳QRIS Rama',
     isConfigured: () => !!RAMA_APIKEY
   },
   KIANARA: {
-    label: '🔵 QRIS GoBiz min Rp.150 (rekomendasi)',
+    label: '💳QRIS GoBiz min Rp.150 rekomendasi',
     isConfigured: () => !!KIANARA_APIKEY
   }
 };
@@ -373,12 +373,14 @@ db.run(`CREATE TABLE IF NOT EXISTS transactions (
             } else {
               logger.info('Kolom reference_id berhasil ditambahkan ke tabel transactions');
             }
+            setTimeout(ensureTransactionUniqueIndex, 2000);
           });
         } else if (row) {
           // Update existing transactions with reference_id
           db.all("SELECT id, user_id, type, timestamp FROM transactions WHERE reference_id IS NULL", [], (err, rows) => {
             if (err) {
               logger.error('Kesalahan mengambil transaksi tanpa reference_id:', err.message);
+              setTimeout(ensureTransactionUniqueIndex, 2000);
               return;
             }
             
@@ -392,12 +394,68 @@ db.run(`CREATE TABLE IF NOT EXISTS transactions (
                 }
               });
             });
+            setTimeout(ensureTransactionUniqueIndex, 2000);
           });
+        } else {
+          setTimeout(ensureTransactionUniqueIndex, 2000);
         }
       });
     });
   }
 });
+
+// ── UNIQUE INDEX ANTI DOUBLE-CREDIT ─────────────────────────────
+// SELECT-lalu-INSERT saja TIDAK cukup untuk mencegah duplikat kalau
+// ada race condition (mis. 2 proses bot jalan bersamaan tanpa
+// disengaja, atau auto-check & tombol "Cek Manual" nyaris bersamaan).
+// UNIQUE index ini membuat constraint-nya atomik di level database:
+// walau 2 request lolos pengecekan SELECT di waktu hampir sama,
+// hanya SATU yang bisa berhasil INSERT — yang kedua otomatis gagal
+// dan kita anggap "sudah diproses" (lihat _processMatchingPaymentCore).
+function ensureTransactionUniqueIndex() {
+  db.run(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_id ON transactions(reference_id)',
+    (err) => {
+      if (!err) {
+        logger.info('✅ UNIQUE index reference_id aktif (anti double-credit).');
+        return;
+      }
+      if (!/unique/i.test(err.message)) {
+        logger.error('Gagal membuat UNIQUE index reference_id:', err.message);
+        return;
+      }
+      // Ada reference_id duplikat dari sebelumnya (mis. akibat bug double-credit
+      // yang sudah pernah terjadi) — bersihkan dulu baris duplikatnya (sisakan yang
+      // paling lama) supaya UNIQUE index bisa dibuat. Ini TIDAK mengurangi saldo
+      // user yang sudah kadung double, cuma membersihkan catatan transaksinya saja.
+      logger.info('⚠️ Ditemukan reference_id duplikat di tabel transactions, membersihkan sebelum membuat UNIQUE index...');
+      db.run(
+        `DELETE FROM transactions
+         WHERE id NOT IN (
+           SELECT MIN(id) FROM transactions
+           WHERE reference_id IS NOT NULL
+           GROUP BY reference_id
+         ) AND reference_id IS NOT NULL`,
+        (delErr) => {
+          if (delErr) {
+            logger.error('Gagal membersihkan reference_id duplikat:', delErr.message);
+            return;
+          }
+          db.run(
+            'CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_id ON transactions(reference_id)',
+            (err2) => {
+              if (err2) {
+                logger.error('Gagal membuat UNIQUE index reference_id (setelah cleanup):', err2.message);
+              } else {
+                logger.info('✅ Duplikat dibersihkan & UNIQUE index reference_id berhasil dibuat.');
+              }
+            }
+          );
+        }
+      );
+    }
+  );
+}
 
 const userState = {};
 logger.info('User state initialized');
@@ -520,11 +578,6 @@ Status: <code>${statusReseller}</code>
 • Bulan Ini   : ${globalMonth} akun
 </blockquote>
 
-⚙️ <b>COMMAND</b>
-• 🏠 Menu Utama   : /start
-• 🔑 Menu Admin   : /admin
-• 🛡️ Admin Panel  : /helpadmin
-
 👥 <b>Pengguna BOT:</b> ${jumlahPengguna}
 ⏱️ <b>Latency:</b> ${latency} ms
 ──────────────────────────`;
@@ -619,8 +672,9 @@ const helpMessage = `
 15. /editnama - Mengedit nama server.
 16. /edittotalcreate - Mengedit total pembuatan akun server.
 17. /hapuslog - Menghapus log bot.
-18. /backup - Menjalankan backup otomatis.
-19. /paymet - Mengubah metode pembayaran (GOPAY, ORKUT, PAKASIR, atau VIOLET).
+18. /backup - Menjalankan backup manual (sekali jalan).
+19. /autobackup - Atur backup otomatis berkala (mis. /autobackup on 60).
+20. /paymet - Mengubah metode pembayaran (GOPAY, ORKUT, PAKASIR, VIOLET, RAMA, atau KIANARA).
 
 Gunakan perintah ini dengan format yang benar untuk menghindari kesalahan.
 `;
@@ -1330,6 +1384,33 @@ bot.action(/toggle_payment_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA|KIANARA)/, async (ct
   }
 });
 
+// ── FUNGSI BACKUP (dipakai command manual /backup maupun auto-backup) ──
+function runBackupProcess(notifyChatId, { silent = false } = {}) {
+  return new Promise((resolve) => {
+    exec('/usr/bin/backup_sellvpn', { timeout: 60 * 1000, maxBuffer: 5 * 1024 * 1024 }, async (err, stdout, stderr) => {
+      if (err) {
+        logger.error('❌ Error menjalankan backup:', err.message);
+        const errMsg = (stderr || err.message || 'Unknown error').toString().slice(0, 1500);
+        if (!silent) {
+          try {
+            await bot.telegram.sendMessage(notifyChatId, `❌ Backup gagal:\n\`\`\`\n${errMsg}\n\`\`\``, { parse_mode: 'Markdown' });
+          } catch (e) { logger.error('Gagal kirim notif backup gagal:', e.message); }
+        }
+        resolve(false);
+        return;
+      }
+
+      const out = (stdout || 'Backup selesai tanpa output').toString().slice(0, 3500);
+      if (!silent) {
+        try {
+          await bot.telegram.sendMessage(notifyChatId, `✅ Backup selesai.\n\`\`\`\n${out}\n\`\`\``, { parse_mode: 'Markdown' });
+        } catch (e) { logger.error('Gagal kirim notif backup selesai:', e.message); }
+      }
+      resolve(true);
+    });
+  });
+}
+
 bot.command('backup', async (ctx) => {
   try {
     const requesterId = ctx.from.id;
@@ -1341,25 +1422,115 @@ bot.command('backup', async (ctx) => {
 
     // konfirmasi start
     await ctx.reply('⚙️ Menjalankan backup... Mohon tunggu sebentar.');
-
-    // jalankan script backup (jangan lewatkan path lengkap)
-    // beri timeout 60s, dan buffer besar agar output panjang tercover
-    exec('/usr/bin/backup_sellvpn', { timeout: 60 * 1000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error('❌ Error menjalankan backup:', err);
-        // kirim pesan error ringkas ke admin (jangan kirim stacktrace panjang)
-        const errMsg = (stderr || err.message || 'Unknown error').toString().slice(0, 1500);
-        return ctx.reply(`❌ Backup gagal:\n\`\`\`\n${errMsg}\n\`\`\``, { parse_mode: 'Markdown' });
-      }
-
-      // bila sukses, kirim sebagian output (batasi panjang)
-      const out = (stdout || 'Backup selesai tanpa output').toString().slice(0, 3500);
-      return ctx.reply(`✅ Backup selesai.\n\`\`\`\n${out}\n\`\`\``, { parse_mode: 'Markdown' });
-    });
+    await runBackupProcess(ctx.chat.id);
 
   } catch (e) {
     console.error('❌ Exception di command /backup:', e);
     await ctx.reply('❌ Terjadi kesalahan internal saat memproses backup.');
+  }
+});
+
+// ── AUTO BACKUP BERKALA (interval diatur admin) ─────────────────
+// vars.AUTO_BACKUP_ENABLED       : true/false
+// vars.AUTO_BACKUP_INTERVAL_MIN  : jarak antar backup dalam menit
+// vars.AUTO_BACKUP_LAST_RUN      : timestamp backup otomatis terakhir (ms)
+// vars.AUTO_BACKUP_CHAT_ID       : tujuan kirim hasil backup (default: ADMIN)
+function isAutoBackupEnabled() {
+  return vars.AUTO_BACKUP_ENABLED === true;
+}
+
+function getAutoBackupIntervalMinutes() {
+  const val = Number(vars.AUTO_BACKUP_INTERVAL_MIN);
+  return Number.isFinite(val) && val > 0 ? val : 60;
+}
+
+setInterval(async () => {
+  try {
+    if (!isAutoBackupEnabled()) return;
+
+    const intervalMs = getAutoBackupIntervalMinutes() * 60 * 1000;
+    const lastRun = Number(vars.AUTO_BACKUP_LAST_RUN) || 0;
+    const now = Date.now();
+
+    if (now - lastRun < intervalMs) return;
+
+    vars.AUTO_BACKUP_LAST_RUN = now;
+    await saveVarsConfig();
+
+    const targetChatId = vars.AUTO_BACKUP_CHAT_ID || ADMIN;
+    logger.info(`[AUTO BACKUP] Menjalankan backup otomatis (interval ${getAutoBackupIntervalMinutes()} menit)...`);
+    await runBackupProcess(targetChatId);
+  } catch (e) {
+    logger.error('[AUTO BACKUP] Error:', e.message);
+  }
+}, 60 * 1000); // cek tiap 1 menit apakah sudah waktunya backup
+
+bot.command('autobackup', async (ctx) => {
+  try {
+    const requesterId = ctx.from.id;
+    if (!adminIds.includes(requesterId)) {
+      return ctx.reply('🚫 Anda tidak memiliki izin untuk menggunakan perintah ini.');
+    }
+
+    const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
+    const sub = (args[0] || '').toLowerCase();
+
+    if (sub === 'on') {
+      const minutes = Number(args[1]);
+      if (args[1] && (!Number.isFinite(minutes) || minutes <= 0)) {
+        return ctx.reply('❌ Interval tidak valid. Contoh: /autobackup on 60 (backup tiap 60 menit)');
+      }
+      vars.AUTO_BACKUP_ENABLED = true;
+      if (minutes) vars.AUTO_BACKUP_INTERVAL_MIN = minutes;
+      vars.AUTO_BACKUP_CHAT_ID = ctx.chat.id;
+      vars.AUTO_BACKUP_LAST_RUN = Date.now(); // hitung mundur dari sekarang, bukan langsung backup detik ini
+      await saveVarsConfig();
+
+      return ctx.reply(
+        `✅ *Auto Backup diaktifkan*\n\n` +
+        `⏱️ Interval: setiap *${getAutoBackupIntervalMinutes()} menit*\n` +
+        `📩 Hasil dikirim ke chat ini.\n\n` +
+        `Backup otomatis pertama akan berjalan sekitar ${getAutoBackupIntervalMinutes()} menit dari sekarang.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    if (sub === 'off') {
+      vars.AUTO_BACKUP_ENABLED = false;
+      await saveVarsConfig();
+      return ctx.reply('🔴 Auto Backup dinonaktifkan.');
+    }
+
+    if (sub === 'status') {
+      if (!isAutoBackupEnabled()) {
+        return ctx.reply('🔴 Auto Backup saat ini *NONAKTIF*.\n\nGunakan `/autobackup on <menit>` untuk mengaktifkan.', { parse_mode: 'Markdown' });
+      }
+      const intervalMin = getAutoBackupIntervalMinutes();
+      const lastRun = Number(vars.AUTO_BACKUP_LAST_RUN) || Date.now();
+      const nextRun = lastRun + intervalMin * 60 * 1000;
+      const minutesLeft = Math.max(0, Math.round((nextRun - Date.now()) / 60000));
+
+      return ctx.reply(
+        `🟢 Auto Backup saat ini *AKTIF*\n\n` +
+        `⏱️ Interval: setiap *${intervalMin} menit*\n` +
+        `🕒 Backup terakhir: ${lastRun ? new Date(lastRun).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }) : '-'}\n` +
+        `⏳ Backup berikutnya: ± ${minutesLeft} menit lagi`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    // Tanpa argumen / argumen tidak dikenal → tampilkan cara pakai
+    return ctx.reply(
+      '💡 *Penggunaan /autobackup:*\n\n' +
+      '`/autobackup on 60` — aktifkan, backup tiap 60 menit\n' +
+      '`/autobackup off` — nonaktifkan\n' +
+      '`/autobackup status` — lihat status & jadwal berikutnya\n\n' +
+      `Status sekarang: ${isAutoBackupEnabled() ? `🟢 AKTIF (tiap ${getAutoBackupIntervalMinutes()} menit)` : '🔴 NONAKTIF'}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    logger.error('❌ Exception di command /autobackup:', e.message);
+    await ctx.reply('❌ Terjadi kesalahan saat mengatur auto backup.');
   }
 });
 
@@ -5560,6 +5731,16 @@ async function _processMatchingPaymentCore(deposit, matchingTransaction, uniqueC
         (err) => {
                   if (err) {
                     db.run('ROLLBACK');
+                    if (/unique/i.test(err.message)) {
+                      // Ke-block oleh UNIQUE index reference_id — artinya proses LAIN
+                      // (auto-check / cek manual / dsb) sudah lebih dulu berhasil
+                      // mencatat transaksi ini di detik yang nyaris sama. Saldo sudah
+                      // pasti ditambahkan oleh proses itu, jadi di sini cukup skip
+                      // (jangan tambah saldo lagi / jangan anggap error).
+                      logger.info(`Transaction ${transactionKey} kena UNIQUE constraint (sudah diproses proses lain), skip.`);
+                      resolve(false);
+                      return;
+                    }
                     logger.error('Error recording transaction:', err);
                     reject(err);
                     return;
