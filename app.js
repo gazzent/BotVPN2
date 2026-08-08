@@ -236,7 +236,7 @@ const PAYMENT_METHODS_INFO = {
     isConfigured: () => !!RAMA_APIKEY
   },
   KIANARA: {
-    label: '🔵 QRIS GoBiz min Rp.100',
+    label: '🔵 QRIS GoBiz min Rp.150',
     isConfigured: () => !!KIANARA_APIKEY
   }
 };
