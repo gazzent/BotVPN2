@@ -205,6 +205,10 @@ const VIOLET_MIN_DEPOSIT = vars.VIOLET_MIN_DEPOSIT || 1000;
 const RAMA_APIKEY = vars.RAMA_APIKEY;
 const RAMA_BASE_URL = 'https://ramashop.my.id/api/public';
 const RAMA_MIN_DEPOSIT = vars.RAMA_MIN_DEPOSIT || 1000;
+// V6 KIANARAPAY (QRIS GOBIZ)
+const KIANARA_APIKEY = vars.KIANARA_APIKEY;
+const KIANARA_BASE_URL = 'https://kianarapay.biz.id';
+const KIANARA_MIN_DEPOSIT = vars.KIANARA_MIN_DEPOSIT || 1000;
 
 // ======================
 // DAFTAR SEMUA METODE PEMBAYARAN YANG DIDUKUNG BOT
@@ -220,7 +224,7 @@ const PAYMENT_METHODS_INFO = {
     isConfigured: () => !!(AUTH_USER && AUTH_TOKEN && vars.DATA_QRIS_ORKUT)
   },
   PAKASIR: {
-    label: '🟣 QRIS Pakasir',
+    label: '🟣 QRIS Pakasir min Rp.500',
     isConfigured: () => !!(PAKASIR_PROJECT && PAKASIR_APIKEY)
   },
   VIOLET: {
@@ -230,6 +234,10 @@ const PAYMENT_METHODS_INFO = {
   RAMA: {
     label: '🟢 QRIS Rama',
     isConfigured: () => !!RAMA_APIKEY
+  },
+  KIANARA: {
+    label: '🔵 QRIS GoBiz min Rp.100',
+    isConfigured: () => !!KIANARA_APIKEY
   }
 };
 
@@ -1290,7 +1298,7 @@ bot.action('admin_payment_methods', async (ctx) => {
   }
 });
 
-bot.action(/toggle_payment_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA)/, async (ctx) => {
+bot.action(/toggle_payment_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA|KIANARA)/, async (ctx) => {
   try {
     const requesterId = ctx.from.id;
     if (!adminIds.includes(requesterId)) {
@@ -1364,12 +1372,12 @@ bot.command(['paymet', 'payment'], async (ctx) => {
 
     const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
     if (!args.length) {
-      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT\natau\n/paymet PAKASIR\natau\n/paymet VIOLET\natau\n/paymet RAMA');
+      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT\natau\n/paymet PAKASIR\natau\n/paymet VIOLET\natau\n/paymet RAMA\natau\n/paymet KIANARA');
     }
 
     const selectedPayment = args[0].toUpperCase();
-    if (!['GOPAY', 'ORKUT', 'PAKASIR', 'VIOLET', 'RAMA'].includes(selectedPayment)) {
-      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY, ORKUT, PAKASIR, VIOLET, atau RAMA yang didukung.');
+    if (!['GOPAY', 'ORKUT', 'PAKASIR', 'VIOLET', 'RAMA', 'KIANARA'].includes(selectedPayment)) {
+      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY, ORKUT, PAKASIR, VIOLET, RAMA, atau KIANARA yang didukung.');
     }
 
     if (selectedPayment === 'PAKASIR' && (!PAKASIR_PROJECT || !PAKASIR_APIKEY)) {
@@ -1382,6 +1390,10 @@ bot.command(['paymet', 'payment'], async (ctx) => {
 
     if (selectedPayment === 'RAMA' && !RAMA_APIKEY) {
       return ctx.reply('❌ RAMA_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
+    }
+
+    if (selectedPayment === 'KIANARA' && !KIANARA_APIKEY) {
+      return ctx.reply('❌ KIANARA_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
     }
 
     vars.PAYMENT = selectedPayment;
@@ -3974,7 +3986,7 @@ bot.action('topup_saldo', async (ctx) => {
   }
 });
 
-bot.action(/topup_method_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA)/, async (ctx) => {
+bot.action(/topup_method_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA|KIANARA)/, async (ctx) => {
   try {
     await ctx.answerCbQuery();
     const userId = ctx.from.id;
@@ -4217,6 +4229,10 @@ async function handleDepositState(ctx, userId, data) {
   // RAMA SHOP punya batas minimal deposit sendiri (default Rp1.000)
   if (paymentMethod === 'RAMA') {
     minDeposit = Math.max(minDeposit, RAMA_MIN_DEPOSIT);
+  }
+  // KIANARAPAY (QRIS GOBIZ) punya batas minimal deposit sendiri (default Rp1.000)
+  if (paymentMethod === 'KIANARA') {
+    minDeposit = Math.max(minDeposit, KIANARA_MIN_DEPOSIT);
   }
 
   let currentAmount = global.depositState[userId].amount || '';
@@ -4841,6 +4857,84 @@ async function processDeposit(ctx, amount, paymentMethod) {
       var ramaExpiredAt = ramaExpiredAtVal;
     }
 
+    // ======================
+    // KIANARAPAY (QRIS GOBIZ)
+    // ======================
+    else if (paymentMethod === "KIANARA") {
+      if (Number(amount) < KIANARA_MIN_DEPOSIT) {
+        throw new Error(`Minimal deposit QRIS GoBiz adalah Rp${KIANARA_MIN_DEPOSIT.toLocaleString()}`);
+      }
+
+      const res = await axios.post(
+        `${KIANARA_BASE_URL}/api/v1/payments`,
+        {
+          reference: uniqueCode,
+          amount: Number(amount),
+          provider: 'gopay',
+          source: 'bot',
+          expires_in_minutes: 15,
+          unique_code_enabled: true,
+          customer_name: ctx.from?.first_name || 'User'
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${KIANARA_APIKEY}`,
+            'Content-Type': 'application/json',
+            'Idempotency-Key': uniqueCode
+          },
+          timeout: 15000
+        }
+      );
+
+      const trx = res.data?.data;
+      if (!trx || !trx.qris_data_url) {
+        throw new Error(res.data?.error?.message || "Gagal create QRIS GoBiz (KianaraPay)");
+      }
+
+      finalAmount = Number(trx.amount); // base_amount + biaya admin + kode unik
+      adminFee = Number(trx.admin_fee) || 0;
+      transactionId = trx.reference;
+
+      const kianaraExpiredAtVal = trx.expires_at ? new Date(trx.expires_at).getTime() : null;
+      const expiredText = trx.expires_at
+        ? new Date(trx.expires_at).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
+        : `${trx.expires_in_minutes || 15} menit dari sekarang`;
+
+      const caption =
+        `📝 *Detail Pembayaran*\n\n` +
+        `💰 Total Bayar: Rp ${finalAmount}\n` +
+        `- Topup: Rp ${amount}\n` +
+        (adminFee > 0 ? `- Biaya Admin: Rp ${adminFee}\n` : ``) +
+        (trx.unique_code ? `- Kode Unik: ${trx.unique_code}\n` : ``) +
+        `\n⏱️ Expired: ${expiredText}\n` +
+        `⚠️ Transfer harus sama persis!\n\n` +
+        `🔄 Sistem otomatis mendeteksi pembayaran.\n` +
+        `Jika belum terdeteksi, tekan *Cek Manual*.`;
+
+      // qris_data_url formatnya "data:image/png;base64,xxxxx"
+      const base64Data = trx.qris_data_url.split(',')[1];
+      const qrBuffer = Buffer.from(base64Data, 'base64');
+
+      qrMessage = await ctx.replyWithPhoto(
+        { source: qrBuffer },
+        {
+          caption,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Cek Manual', callback_data: `cek_topup_${uniqueCode}` }],
+              [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
+            ]
+          }
+        }
+      );
+
+      qrImageUrl = trx.qris_url;
+
+      if (!global.pendingDeposits) global.pendingDeposits = {};
+      var kianaraExpiredAt = kianaraExpiredAtVal;
+    }
+
     else throw new Error("PAYMENT tidak valid");
 
     // ======================
@@ -4860,6 +4954,7 @@ async function processDeposit(ctx, amount, paymentMethod) {
       expiredAt: typeof pakasirExpiredAt !== 'undefined' ? pakasirExpiredAt
         : typeof violetExpiredAt !== 'undefined' ? violetExpiredAt
         : typeof ramaExpiredAt !== 'undefined' ? ramaExpiredAt
+        : typeof kianaraExpiredAt !== 'undefined' ? kianaraExpiredAt
         : null,
       violetRefKode: typeof violetRefKode !== 'undefined' ? violetRefKode : null,
       violetIdReference: typeof violetIdReference !== 'undefined' ? violetIdReference : null,
@@ -4922,6 +5017,7 @@ async function _checkQRISStatusInner() {
   const EXPIRE_PAKASIR = 15 * 60 * 1000;  // 15 menit (fallback jika expired_at tidak ada)
   const EXPIRE_VIOLET  = 15 * 60 * 1000;  // 15 menit (fallback jika expired_time tidak ada)
   const EXPIRE_RAMA    = 15 * 60 * 1000;  // 15 menit (fallback jika expiredAt tidak ada)
+  const EXPIRE_KIANARA = 15 * 60 * 1000;  // 15 menit (fallback jika expires_at tidak ada)
 
   for (const [uniqueCode, deposit] of Object.entries(global.pendingDeposits)) {
     if (deposit.status !== 'pending') continue;
@@ -4934,8 +5030,9 @@ async function _checkQRISStatusInner() {
         : paymentMethod === "PAKASIR" ? EXPIRE_PAKASIR
         : paymentMethod === "VIOLET" ? EXPIRE_VIOLET
         : paymentMethod === "RAMA" ? EXPIRE_RAMA
+        : paymentMethod === "KIANARA" ? EXPIRE_KIANARA
         : EXPIRE_ORKUT;
-      const isExpired = (paymentMethod === "PAKASIR" || paymentMethod === "VIOLET" || paymentMethod === "RAMA") && deposit.expiredAt
+      const isExpired = (paymentMethod === "PAKASIR" || paymentMethod === "VIOLET" || paymentMethod === "RAMA" || paymentMethod === "KIANARA") && deposit.expiredAt
         ? now > deposit.expiredAt
         : (now - deposit.timestamp > defaultMaxAge);
       if (isExpired) {
@@ -5082,6 +5179,22 @@ Silakan buat topup baru jika masih ingin melanjutkan.`,
           delete global.pendingDeposits[uniqueCode];
           db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
         }
+
+      // ── KIANARAPAY / QRIS GOBIZ (AUTO CEK REALTIME) ──────────
+      } else if (paymentMethod === "KIANARA") {
+        const status = await checkKianaraStatus(deposit, uniqueCode);
+        if (status !== 'paid') continue;
+
+        logger.info(`[AUTO][KIANARA] 💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const success = await processMatchingPayment(
+          deposit,
+          { reference_id: uniqueCode, amount: deposit.amount },
+          uniqueCode
+        );
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        }
       }
 
     } catch (err) {
@@ -5158,6 +5271,29 @@ async function checkRamaStatus(deposit, uniqueCode) {
     const status = res.data?.data?.status;
     logger.info(`[AUTO][RAMA] ${uniqueCode} | ${status}`);
     return status; // 'pending' | 'success' | 'already'
+  } catch (err) {
+    return 'pending';
+  }
+}
+
+// Cek status transaksi KIANARAPAY (QRIS GoBiz) via endpoint check
+async function checkKianaraStatus(deposit, uniqueCode) {
+  try {
+    const res = await axios.post(
+      `${KIANARA_BASE_URL}/api/v1/payments/${encodeURIComponent(uniqueCode)}/check`,
+      {},
+      {
+        headers: {
+          Authorization: `Bearer ${KIANARA_APIKEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      }
+    );
+
+    const status = res.data?.data?.status;
+    logger.info(`[AUTO][KIANARA] ${uniqueCode} | ${status}`);
+    return status; // 'pending' | 'paid' | 'expired' | 'cancelled'
   } catch (err) {
     return 'pending';
   }
@@ -5248,6 +5384,15 @@ bot.action(/^cek_topup_(.+)$/, async (ctx) => {
     } else if (paymentMethod === 'RAMA') {
       const status = await checkRamaStatus(depositData, code);
       if (status === 'success') {
+        success = await processMatchingPayment(
+          depositData,
+          { reference_id: code, amount: depositData.amount },
+          code
+        );
+      }
+    } else if (paymentMethod === 'KIANARA') {
+      const status = await checkKianaraStatus(depositData, code);
+      if (status === 'paid') {
         success = await processMatchingPayment(
           depositData,
           { reference_id: code, amount: depositData.amount },
