@@ -209,6 +209,10 @@ const RAMA_MIN_DEPOSIT = vars.RAMA_MIN_DEPOSIT || 1000;
 const KIANARA_APIKEY = vars.KIANARA_APIKEY;
 const KIANARA_BASE_URL = 'https://kianarapay.biz.id';
 const KIANARA_MIN_DEPOSIT = vars.KIANARA_MIN_DEPOSIT || 1000;
+// V7 PAYKITA (QRIS GOBIZ V2 / QRIS GOPAY MERCHANT)
+const PAYKITA_APIKEY = vars.PAYKITA_APIKEY;         // API key Project di PayKita (pk_live_...)
+const PAYKITA_BASE_URL = 'https://pay.digikita.id/api';
+const PAYKITA_MIN_DEPOSIT = vars.PAYKITA_MIN_DEPOSIT || 150;
 
 // ======================
 // DAFTAR SEMUA METODE PEMBAYARAN YANG DIDUKUNG BOT
@@ -219,33 +223,31 @@ const PAYMENT_METHODS_INFO = {
     label: '💚 GOPAY QRIS',
     isConfigured: () => !!GOPAY_KEY
   },
-  ORKUT: {
-    label: '🏧 ORKUT QRIS',
-    isConfigured: () => !!(AUTH_USER && AUTH_TOKEN && vars.DATA_QRIS_ORKUT)
-  },
   PAKASIR: {
     label: '💳QRIS Pakasir min Rp.500',
     isConfigured: () => !!(PAKASIR_PROJECT && PAKASIR_APIKEY)
-  },
-  VIOLET: {
-    label: '💳QRIS Violet',
-    isConfigured: () => !!(VIOLET_APIKEY && VIOLET_SECRETKEY)
   },
   RAMA: {
     label: '💳QRIS Rama',
     isConfigured: () => !!RAMA_APIKEY
   },
   KIANARA: {
-    label: '💳QRIS GoBiz min Rp.150 rekomendasi',
+    label: 'QRIS GoBiz min Rp.150 ',
     isConfigured: () => !!KIANARA_APIKEY
+  },
+  PAYKITA: {
+    label: 'Qris GoBiz v2 min rp.150 recomended',
+    isConfigured: () => !!PAYKITA_APIKEY
   }
 };
 
 // Default metode yang aktif kalau admin belum pernah atur (backward compatible)
 function getEnabledPayments() {
   if (!Array.isArray(vars.ENABLED_PAYMENTS)) {
-    vars.ENABLED_PAYMENTS = ['PAKASIR', 'VIOLET'];
+    vars.ENABLED_PAYMENTS = ['PAKASIR'];
   }
+  // 🚫 ORKUT & VIOLET sudah dihapus dari metode pembayaran yang didukung
+  vars.ENABLED_PAYMENTS = vars.ENABLED_PAYMENTS.filter(m => m !== 'ORKUT' && m !== 'VIOLET');
   return vars.ENABLED_PAYMENTS;
 }
 
@@ -596,6 +598,10 @@ let keyboard;
     ],
     [
       { text: '🤝 Jadi Reseller & Dapat Harga Spesial', callback_data: 'jadi_reseller' }
+    ],
+    [
+      { text: '🐞 List Bug WC', url: 'https://t.me/shadowchn/28' },
+      { text: '👨‍💻 ADMIN', url: 'https://t.me/shadowvpn_store' }
     ]
   ];
   try {
@@ -674,7 +680,7 @@ const helpMessage = `
 17. /hapuslog - Menghapus log bot.
 18. /backup - Menjalankan backup manual (sekali jalan).
 19. /autobackup - Atur backup otomatis berkala (mis. /autobackup on 60).
-20. /paymet - Mengubah metode pembayaran (GOPAY, ORKUT, PAKASIR, VIOLET, RAMA, atau KIANARA).
+20. /paymet - Mengubah metode pembayaran (GOPAY, PAKASIR, RAMA, KIANARA, atau PAYKITA).
 
 Gunakan perintah ini dengan format yang benar untuk menghindari kesalahan.
 `;
@@ -1352,7 +1358,7 @@ bot.action('admin_payment_methods', async (ctx) => {
   }
 });
 
-bot.action(/toggle_payment_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA|KIANARA)/, async (ctx) => {
+bot.action(/toggle_payment_(GOPAY|PAKASIR|RAMA|KIANARA|PAYKITA)/, async (ctx) => {
   try {
     const requesterId = ctx.from.id;
     if (!adminIds.includes(requesterId)) {
@@ -1385,15 +1391,41 @@ bot.action(/toggle_payment_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA|KIANARA)/, async (ct
 });
 
 // ── FUNGSI BACKUP (dipakai command manual /backup maupun auto-backup) ──
+// Lock supaya backup gak bisa jalan dobel bersamaan (mis. admin pencet /backup
+// dua kali, atau auto-backup nyala pas lagi ada backup manual jalan). Backup
+// dobel bisa bikin 2 proses rebutan baca/tulis file .db yang sama di waktu
+// bersamaan → hasil bisa korup/kepotong/bot kelihatan macet.
+let _isBackupRunning = false;
+
 function runBackupProcess(notifyChatId, { silent = false } = {}) {
   return new Promise((resolve) => {
-    exec('/usr/bin/backup_sellvpn', { timeout: 60 * 1000, maxBuffer: 5 * 1024 * 1024 }, async (err, stdout, stderr) => {
+    if (_isBackupRunning) {
+      logger.info('[BACKUP] Ada proses backup lain masih berjalan, request ini di-skip.');
+      if (!silent) {
+        bot.telegram.sendMessage(notifyChatId, '⚠️ Ada proses backup lain yang masih berjalan. Coba lagi sebentar.').catch(() => {});
+      }
+      resolve(false);
+      return;
+    }
+
+    _isBackupRunning = true;
+    // Timeout dinaikkan ke 3 menit — 3 file dikirim satu-satu ke Telegram lewat
+    // curl di script backup_sellvpn, kalau koneksi lagi lambat 60 detik sering
+    // gak cukup dan proses ke-KILL di tengah jalan (persis gejala "salah satu
+        // file gak kekirim").
+    const child = exec('/usr/bin/backup_sellvpn', { timeout: 3 * 60 * 1000, maxBuffer: 5 * 1024 * 1024 }, async (err, stdout, stderr) => {
+      _isBackupRunning = false;
+
       if (err) {
         logger.error('❌ Error menjalankan backup:', err.message);
+        const wasKilledByTimeout = err.killed === true || err.signal === 'SIGTERM';
         const errMsg = (stderr || err.message || 'Unknown error').toString().slice(0, 1500);
         if (!silent) {
           try {
-            await bot.telegram.sendMessage(notifyChatId, `❌ Backup gagal:\n\`\`\`\n${errMsg}\n\`\`\``, { parse_mode: 'Markdown' });
+            const prefix = wasKilledByTimeout
+              ? '⏱️ Backup dihentikan paksa karena melebihi batas waktu (kemungkinan koneksi lambat saat upload file ke Telegram). Ada kemungkinan sebagian file sudah terkirim, sebagian belum:\n\n'
+              : '';
+            await bot.telegram.sendMessage(notifyChatId, `❌ Backup gagal:\n${prefix}\`\`\`\n${errMsg}\n\`\`\``, { parse_mode: 'Markdown' });
           } catch (e) { logger.error('Gagal kirim notif backup gagal:', e.message); }
         }
         resolve(false);
@@ -1408,6 +1440,16 @@ function runBackupProcess(notifyChatId, { silent = false } = {}) {
       }
       resolve(true);
     });
+
+    // Jaga-jaga: kalau karena suatu sebab callback exec() di atas gak pernah
+    // terpanggil (proses child jadi zombie), lepas lock ini otomatis setelah
+    // 4 menit supaya backup berikutnya gak ke-skip selamanya.
+    setTimeout(() => {
+      if (_isBackupRunning) {
+        logger.error('[BACKUP] Lock backup tidak terlepas otomatis, dipaksa reset setelah 4 menit.');
+        _isBackupRunning = false;
+      }
+    }, 4 * 60 * 1000);
   });
 }
 
@@ -1543,20 +1585,16 @@ bot.command(['paymet', 'payment'], async (ctx) => {
 
     const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
     if (!args.length) {
-      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT\natau\n/paymet PAKASIR\natau\n/paymet VIOLET\natau\n/paymet RAMA\natau\n/paymet KIANARA');
+      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet PAKASIR\natau\n/paymet RAMA\natau\n/paymet KIANARA\natau\n/paymet PAYKITA');
     }
 
     const selectedPayment = args[0].toUpperCase();
-    if (!['GOPAY', 'ORKUT', 'PAKASIR', 'VIOLET', 'RAMA', 'KIANARA'].includes(selectedPayment)) {
-      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY, ORKUT, PAKASIR, VIOLET, RAMA, atau KIANARA yang didukung.');
+    if (!['GOPAY', 'PAKASIR', 'RAMA', 'KIANARA', 'PAYKITA'].includes(selectedPayment)) {
+      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY, PAKASIR, RAMA, KIANARA, atau PAYKITA yang didukung.');
     }
 
     if (selectedPayment === 'PAKASIR' && (!PAKASIR_PROJECT || !PAKASIR_APIKEY)) {
       return ctx.reply('❌ PAKASIR_PROJECT / PAKASIR_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
-    }
-
-    if (selectedPayment === 'VIOLET' && (!VIOLET_APIKEY || !VIOLET_SECRETKEY)) {
-      return ctx.reply('❌ VIOLET_APIKEY / VIOLET_SECRETKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
     }
 
     if (selectedPayment === 'RAMA' && !RAMA_APIKEY) {
@@ -1565,6 +1603,10 @@ bot.command(['paymet', 'payment'], async (ctx) => {
 
     if (selectedPayment === 'KIANARA' && !KIANARA_APIKEY) {
       return ctx.reply('❌ KIANARA_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
+    }
+
+    if (selectedPayment === 'PAYKITA' && !PAYKITA_APIKEY) {
+      return ctx.reply('❌ PAYKITA_APIKEY belum diset di .vars.json. Silakan set terlebih dahulu.');
     }
 
     vars.PAYMENT = selectedPayment;
@@ -3103,6 +3145,16 @@ if (exp > 365) {
               msg = await createssh(username, password, exp, iplimit, serverId);
               await recordAccountTransaction(ctx.from.id, 'ssh');
             }
+            // ✅ Update jumlah akun yang benar-benar dibuat (bukan trial) setiap kali create berhasil
+            db.run(
+              'UPDATE Server SET total_create_akun = COALESCE(total_create_akun, 0) + 1 WHERE id = ?',
+              [serverId],
+              (errTotal) => {
+                if (errTotal) {
+                  logger.error('⚠️ Gagal update total_create_akun:', errTotal.message);
+                }
+              }
+            );
             logger.info(`Account created and transaction recorded for user ${ctx.from.id}, type: ${type}`);
 const maskedUsername = username.length > 1 
   ? `${username.slice(0, 1)}${'x'.repeat(username.length - 1)}` 
@@ -4157,7 +4209,7 @@ bot.action('topup_saldo', async (ctx) => {
   }
 });
 
-bot.action(/topup_method_(GOPAY|ORKUT|PAKASIR|VIOLET|RAMA|KIANARA)/, async (ctx) => {
+bot.action(/topup_method_(GOPAY|PAKASIR|RAMA|KIANARA|PAYKITA)/, async (ctx) => {
   try {
     await ctx.answerCbQuery();
     const userId = ctx.from.id;
@@ -4404,6 +4456,10 @@ async function handleDepositState(ctx, userId, data) {
   // KIANARAPAY (QRIS GOBIZ) punya batas minimal deposit sendiri (default Rp1.000)
   if (paymentMethod === 'KIANARA') {
     minDeposit = Math.max(minDeposit, KIANARA_MIN_DEPOSIT);
+  }
+  // PAYKITA (QRIS GoBiz V2 / QRIS GoPay Merchant) punya batas minimal deposit sendiri (default Rp1.000)
+  if (paymentMethod === 'PAYKITA') {
+    minDeposit = Math.max(minDeposit, PAYKITA_MIN_DEPOSIT);
   }
 
   let currentAmount = global.depositState[userId].amount || '';
@@ -4685,6 +4741,14 @@ async function processDeposit(ctx, amount, paymentMethod) {
   }
 
   lastRequestTime = currentTime;
+
+  // Kasih indikasi ke user kalau bot lagi proses (beberapa metode/provider,
+  // terutama KIANARA/GoBiz, butuh waktu beberapa detik buat generate QRIS
+  // karena manggil API GoPay/GoBiz secara real-time di sisi mereka).
+  let loadingMsg;
+  try {
+    loadingMsg = await ctx.reply('⏳ Membuat QRIS pembayaran, mohon tunggu sebentar...');
+  } catch (e) { /* abaikan kalau gagal kirim, gak fatal */ }
 
   const userId = ctx.from.id;
   const uniqueCode = `user-${userId}-${Date.now()}`;
@@ -5106,7 +5170,87 @@ async function processDeposit(ctx, amount, paymentMethod) {
       var kianaraExpiredAt = kianaraExpiredAtVal;
     }
 
+    // ======================
+    // PAYKITA (QRIS GOBIZ V2 / QRIS GOPAY MERCHANT)
+    // ======================
+    else if (paymentMethod === "PAYKITA") {
+      if (Number(amount) < PAYKITA_MIN_DEPOSIT) {
+        throw new Error(`Minimal deposit QRIS PayKita adalah Rp${PAYKITA_MIN_DEPOSIT.toLocaleString()}`);
+      }
+
+      const res = await axios.post(
+        `${PAYKITA_BASE_URL}/orders`,
+        {
+          base_amount: Number(amount),
+          reference: uniqueCode,
+          ttl_seconds: 900 // 15 menit
+        },
+        {
+          headers: {
+            'x-api-key': PAYKITA_APIKEY,
+            'content-type': 'application/json'
+          },
+          timeout: 15000
+        }
+      );
+
+      const trx = res.data?.data;
+      if (!res.data?.ok || !trx || !trx.qris) {
+        throw new Error(res.data?.error?.message || "Gagal create QRIS PayKita");
+      }
+
+      finalAmount = Number(trx.pay_amount); // base_amount + fee_amount + unique_code
+      adminFee = Number(trx.fee_amount || 0) + Number(trx.unique_code || 0);
+      transactionId = trx.id; // pay_...
+
+      const paykitaExpiredAtVal = trx.expires_at ? new Date(trx.expires_at).getTime() : null;
+      const expiredText = trx.expires_at
+        ? new Date(trx.expires_at).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
+        : '15 menit dari sekarang';
+
+      // qris dari PayKita berupa string QRIS statis+nominal, bukan gambar, jadi digenerate jadi PNG
+      const qrBuffer = await QRCode.toBuffer(trx.qris, {
+        type: 'png',
+        width: 500,
+        margin: 1
+      });
+
+      const caption =
+        `📝 *Detail Pembayaran*\n\n` +
+        `💰 Total Bayar: Rp ${finalAmount}\n` +
+        `- Topup: Rp ${amount}\n` +
+        (adminFee > 0 ? `- Biaya Admin + Kode Unik: Rp ${adminFee}\n` : ``) +
+        `\n⏱️ Expired: ${expiredText}\n` +
+        `⚠️ Transfer harus sama persis!\n\n` +
+        `🔄 Sistem otomatis mendeteksi pembayaran.\n` +
+        `Jika belum terdeteksi, tekan *Cek Manual*.`;
+
+      qrMessage = await ctx.replyWithPhoto(
+        { source: qrBuffer },
+        {
+          caption,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Cek Manual', callback_data: `cek_topup_${uniqueCode}` }],
+              [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
+            ]
+          }
+        }
+      );
+
+      qrImageUrl = trx.checkout_url;
+
+      if (!global.pendingDeposits) global.pendingDeposits = {};
+      var paykitaExpiredAt = paykitaExpiredAtVal;
+    }
+
     else throw new Error("PAYMENT tidak valid");
+
+    // Hapus pesan loading — QR sudah berhasil dibuat & terkirim di atas
+    if (loadingMsg) {
+      ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    }
 
     // ======================
     // SIMPAN MEMORY
@@ -5126,6 +5270,7 @@ async function processDeposit(ctx, amount, paymentMethod) {
         : typeof violetExpiredAt !== 'undefined' ? violetExpiredAt
         : typeof ramaExpiredAt !== 'undefined' ? ramaExpiredAt
         : typeof kianaraExpiredAt !== 'undefined' ? kianaraExpiredAt
+        : typeof paykitaExpiredAt !== 'undefined' ? paykitaExpiredAt
         : null,
       violetRefKode: typeof violetRefKode !== 'undefined' ? violetRefKode : null,
       violetIdReference: typeof violetIdReference !== 'undefined' ? violetIdReference : null,
@@ -5158,6 +5303,10 @@ async function processDeposit(ctx, amount, paymentMethod) {
   } catch (error) {
     console.error("❌ Deposit error:", error.message);
 
+    if (loadingMsg) {
+      ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
+    }
+
     await ctx.reply(
       '❌ Gagal membuat QRIS, coba lagi nanti.\n⚠️ Detail: ' + error.message,
       { parse_mode: 'Markdown' }
@@ -5189,6 +5338,7 @@ async function _checkQRISStatusInner() {
   const EXPIRE_VIOLET  = 15 * 60 * 1000;  // 15 menit (fallback jika expired_time tidak ada)
   const EXPIRE_RAMA    = 15 * 60 * 1000;  // 15 menit (fallback jika expiredAt tidak ada)
   const EXPIRE_KIANARA = 15 * 60 * 1000;  // 15 menit (fallback jika expires_at tidak ada)
+  const EXPIRE_PAYKITA = 15 * 60 * 1000;  // 15 menit (fallback jika expires_at tidak ada)
 
   for (const [uniqueCode, deposit] of Object.entries(global.pendingDeposits)) {
     if (deposit.status !== 'pending') continue;
@@ -5202,8 +5352,9 @@ async function _checkQRISStatusInner() {
         : paymentMethod === "VIOLET" ? EXPIRE_VIOLET
         : paymentMethod === "RAMA" ? EXPIRE_RAMA
         : paymentMethod === "KIANARA" ? EXPIRE_KIANARA
+        : paymentMethod === "PAYKITA" ? EXPIRE_PAYKITA
         : EXPIRE_ORKUT;
-      const isExpired = (paymentMethod === "PAKASIR" || paymentMethod === "VIOLET" || paymentMethod === "RAMA" || paymentMethod === "KIANARA") && deposit.expiredAt
+      const isExpired = (paymentMethod === "PAKASIR" || paymentMethod === "VIOLET" || paymentMethod === "RAMA" || paymentMethod === "KIANARA" || paymentMethod === "PAYKITA") && deposit.expiredAt
         ? now > deposit.expiredAt
         : (now - deposit.timestamp > defaultMaxAge);
       if (isExpired) {
@@ -5366,6 +5517,22 @@ Silakan buat topup baru jika masih ingin melanjutkan.`,
           delete global.pendingDeposits[uniqueCode];
           db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
         }
+
+      // ── PAYKITA / QRIS GOBIZ V2 (AUTO CEK REALTIME) ──────────
+      } else if (paymentMethod === "PAYKITA") {
+        const status = await checkPaykitaStatus(deposit, uniqueCode);
+        if (status !== 'paid') continue;
+
+        logger.info(`[AUTO][PAYKITA] 💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const success = await processMatchingPayment(
+          deposit,
+          { reference_id: uniqueCode, amount: deposit.amount },
+          uniqueCode
+        );
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        }
       }
 
     } catch (err) {
@@ -5470,6 +5637,27 @@ async function checkKianaraStatus(deposit, uniqueCode) {
   }
 }
 
+// Cek status order PAYKITA (QRIS GoBiz V2 / QRIS GoPay Merchant) via GET /api/orders/:id
+async function checkPaykitaStatus(deposit, uniqueCode) {
+  try {
+    if (!deposit.transactionId) return 'pending';
+
+    const res = await axios.get(
+      `${PAYKITA_BASE_URL}/orders/${encodeURIComponent(deposit.transactionId)}`,
+      {
+        headers: { 'x-api-key': PAYKITA_APIKEY },
+        timeout: 15000
+      }
+    );
+
+    const status = res.data?.data?.status;
+    logger.info(`[AUTO][PAYKITA] ${uniqueCode} | ${status}`);
+    return status; // 'pending' | 'paid' | 'expired' | 'cancelled'
+  } catch (err) {
+    return 'pending';
+  }
+}
+
 // ── AUTO LOOP AKTIF ──────────────────────────────────────────
 // Berjalan terus tiap 5 detik, checkQRISStatus() sendiri akan
 // membedakan cara cek tiap deposit berdasarkan paymentMethod
@@ -5563,6 +5751,15 @@ bot.action(/^cek_topup_(.+)$/, async (ctx) => {
       }
     } else if (paymentMethod === 'KIANARA') {
       const status = await checkKianaraStatus(depositData, code);
+      if (status === 'paid') {
+        success = await processMatchingPayment(
+          depositData,
+          { reference_id: code, amount: depositData.amount },
+          code
+        );
+      }
+    } else if (paymentMethod === 'PAYKITA') {
+      const status = await checkPaykitaStatus(depositData, code);
       if (status === 'paid') {
         success = await processMatchingPayment(
           depositData,
