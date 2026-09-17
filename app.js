@@ -6,6 +6,7 @@ const app = express();
 const axios = require('axios');
 const dns = require('dns').promises;
 const { isUserReseller, addReseller, removeReseller, listResellersSync } = require('./modules/reseller');
+const shopeePay = require('./modules/shopee-pay');
 const winston = require('winston');
 const logger = winston.createLogger({
   level: 'info',
@@ -184,6 +185,12 @@ db.run(`CREATE TABLE IF NOT EXISTS pending_deposits (
 )`, (err) => {
   if (err) {
     logger.error('Kesalahan membuat tabel pending_deposits:', err.message);
+  }
+});
+
+db.run(`ALTER TABLE pending_deposits ADD COLUMN transaction_id TEXT`, (err) => {
+  if (err && !err.message.includes('duplicate column')) {
+    logger.error('Gagal menambahkan kolom transaction_id di pending_deposits:', err.message);
   }
 });
 
@@ -507,7 +514,7 @@ const helpMessage = `
 16. /edittotalcreate - Mengedit total pembuatan akun server.
 17. /hapuslog - Menghapus log bot.
 18. /backup - Menjalankan backup otomatis.
-19. /paymet - Mengubah metode pembayaran (GOPAY atau ORKUT).
+19. /paymet - Mengubah metode pembayaran (GOPAY, ORKUT, atau SHOPEEPAY).
 
 Gunakan perintah ini dengan format yang benar untuk menghindari kesalahan.
 `;
@@ -1168,12 +1175,12 @@ bot.command(['paymet', 'payment'], async (ctx) => {
 
     const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
     if (!args.length) {
-      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT');
+      return ctx.reply('❌ Penggunaan salah. Gunakan:\n/paymet GOPAY\natau\n/paymet ORKUT\natau\n/paymet SHOPEEPAY');
     }
 
     const selectedPayment = args[0].toUpperCase();
-    if (selectedPayment !== 'GOPAY' && selectedPayment !== 'ORKUT') {
-      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY atau ORKUT yang didukung.');
+    if (!['GOPAY', 'ORKUT', 'SHOPEEPAY'].includes(selectedPayment)) {
+      return ctx.reply('❌ Pilihan tidak valid. Hanya GOPAY, ORKUT, atau SHOPEEPAY yang didukung.');
     }
 
     vars.PAYMENT = selectedPayment;
@@ -4089,7 +4096,9 @@ db.all('SELECT * FROM pending_deposits WHERE status = "pending"', [], (err, rows
       userId: row.user_id,
       timestamp: row.timestamp,
       status: row.status,
-      qrMessageId: row.qr_message_id
+      qrMessageId: row.qr_message_id,
+      transactionId: row.transaction_id,
+      paymentMethod: vars.PAYMENT
     };
   });
   logger.info('Pending deposit loaded:', Object.keys(global.pendingDeposits).length);
@@ -4248,6 +4257,48 @@ async function processDeposit(ctx, amount) {
       qrImageUrl = data.image_data.trim(); // untuk checker
     }
 
+    // ======================
+    // SHOPEEPAY
+    // ======================
+    else if (vars.PAYMENT === "SHOPEEPAY") {
+      finalAmount = Number(amount);
+      adminFee = 0;
+
+      const res = await shopeePay.createQRIS(Number(amount), vars);
+
+      if (res.status !== 'success' || !res.transaction_sn || !res.qr_image) {
+        throw new Error("Gagal create QRIS ShopeePay");
+      }
+
+      transactionId = res.transaction_sn;
+      qrImageUrl = res.qr_image;
+      const expiredMenit = res.expired_minutes || 20;
+
+      const imageBuffer = Buffer.from(res.qr_image, 'base64');
+
+      const caption =
+        `📝 *Detail Pembayaran*\n\n` +
+        `💰 Total: Rp ${finalAmount}\n` +
+        `- Topup: Rp ${amount}\n` +
+        (adminFee > 0 ? `- Admin: Rp ${adminFee}\n` : ``) +
+        `\n⏱️ Expired: ${expiredMenit} menit\n` +
+        `⚠️ Transfer harus sama persis!\n`;
+
+      qrMessage = await ctx.replyWithPhoto(
+        { source: imageBuffer },
+        {
+          caption,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Cek Pembayaran', callback_data: `cek_topup_${uniqueCode}` }],
+              [{ text: '❌ Batal', callback_data: `batal_topup_${uniqueCode}` }]
+            ]
+          }
+        }
+      );
+    }
+
     else throw new Error("PAYMENT tidak valid");
 
     // ======================
@@ -4271,8 +4322,8 @@ async function processDeposit(ctx, amount) {
     // ======================
     db.run(
       `INSERT INTO pending_deposits 
-      (unique_code, user_id, amount, original_amount, timestamp, status, qr_message_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      (unique_code, user_id, amount, original_amount, timestamp, status, qr_message_id, transaction_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         uniqueCode,
         userId,
@@ -4280,7 +4331,8 @@ async function processDeposit(ctx, amount) {
         Number(amount),
         Date.now(),
         'pending',
-        qrMessage?.message_id
+        qrMessage?.message_id,
+        transactionId
       ]
     );
 
@@ -4353,6 +4405,32 @@ async function checkQRISStatus() {
       } else if (paymentMethod === "ORKUT") {
         logger.info(`[QRIS] Skip auto ORKUT check ${uniqueCode}`);
         continue;
+      } else if (paymentMethod === "SHOPEEPAY") {
+        const orderSn = deposit.transactionId;
+        if (!orderSn) continue;
+
+        const res = await shopeePay.checkPayment(orderSn, vars);
+        if (res.status !== 'success') continue;
+
+        const paid = res.order_status === 1 || res.paid === true;
+        logger.info(`🔍 ${uniqueCode} | ShopeePay paid=${paid}`);
+        if (!paid) continue;
+
+        logger.info(`💰 PEMBAYARAN MASUK ${uniqueCode}`);
+        const td = (res.transaction_data && res.transaction_data.order_status !== undefined) ? res.transaction_data : {};
+        const success = await processMatchingPayment(
+          deposit,
+          {
+            amount: td.amount || res.amount || deposit.amount,
+            reference_id: td.transaction_id || res.transaction_id || uniqueCode
+          },
+          uniqueCode
+        );
+
+        if (success) {
+          delete global.pendingDeposits[uniqueCode];
+          db.run('DELETE FROM pending_deposits WHERE unique_code = ?', [uniqueCode]);
+        }
       }
 
     } catch (err) {
@@ -4415,7 +4493,50 @@ bot.action(/^cek_topup_(.+)$/, async (ctx) => {
 
   await ctx.answerCbQuery('Mengecek pembayaran...');
   try {
-    const success = await checkOrkutPendingDeposit(depositData, code);
+    const paymentMethod = depositData.paymentMethod || vars.PAYMENT;
+    let success = false;
+
+    if (paymentMethod === 'GOPAY') {
+      const res = await axios.post(
+        "https://v1-gateway.autogopay.site/qris/status",
+        { transaction_id: depositData.transactionId },
+        {
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GOPAY_KEY}` },
+          timeout: 15000
+        }
+      );
+      const data = res.data?.data;
+      if (!data) throw new Error('Gagal ambil status GOPAY.');
+      if (data.transaction_status !== 'settlement') {
+        return ctx.reply(`❌ Status: ${data.transaction_status}. Belum settlement.`);
+      }
+      success = await processMatchingPayment(depositData, data, code);
+    } else if (paymentMethod === 'ORKUT') {
+      success = await checkOrkutPendingDeposit(depositData, code);
+    } else if (paymentMethod === 'SHOPEEPAY') {
+      const orderSn = depositData.transactionId;
+      if (!orderSn) throw new Error('Data order Sn ShopeePay tidak ditemukan.');
+
+      const res = await shopeePay.checkPayment(orderSn, vars);
+      if (res.status !== 'success') throw new Error('Gagal ambil status ShopeePay.');
+
+      if (res.order_status !== 1 && res.paid !== true) {
+        return ctx.reply('⚠️ Belum ada pembayaran yang sesuai. Tekan lagi setelah user melakukan transfer.');
+      }
+
+      const td = (res.transaction_data && res.transaction_data.order_status !== undefined) ? res.transaction_data : {};
+      success = await processMatchingPayment(
+        depositData,
+        {
+          amount: td.amount || res.amount || depositData.amount,
+          reference_id: td.transaction_id || res.transaction_id || code
+        },
+        code
+      );
+    } else {
+      return ctx.answerCbQuery('Metode pembayaran tidak dikenal.', { show_alert: true });
+    }
+
     if (success) {
       await ctx.reply('✅ Pembayaran terdeteksi dan saldo berhasil ditambahkan.');
     } else {

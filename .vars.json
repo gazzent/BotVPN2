@@ -12,5 +12,6 @@
   "DATA_QRIS_ORKUT": "-",
   "AUTH_USERNAME_ORKUT": "-",
   "AUTH_TOKEN_ORKUT": "-",
-  "WEB_MUTILASI_ORKUT": "https://app.orderkuota.com/api/v2/qris/mutasi/-"
+  "WEB_MUTILASI_ORKUT": "https://app.orderkuota.com/api/v2/qris/mutasi/-",
+  "SHOPEEPAY_BASE_URL": "http://localhost:2007"
 }
